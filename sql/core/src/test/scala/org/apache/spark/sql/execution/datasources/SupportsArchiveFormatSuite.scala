@@ -224,9 +224,11 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
   }
 
   /** Drains every entry into `(name, decodedText)` pairs through `SupportsArchiveFormat`. */
-  private def collect(file: File): Seq[(String, String)] =
+  private def collect(
+      file: File,
+      conf: Configuration = new Configuration()): Seq[(String, String)] =
     SupportsArchiveFormat.readArchiveEntries(
-        new Path(file.toURI), new Configuration(), archivePathFilter = None) {
+        new Path(file.toURI), conf, archivePathFilter = None) {
       (entry, in) =>
         Iterator.single((entry.getName, new String(readAll(in), StandardCharsets.UTF_8)))
     }.toList
@@ -784,10 +786,12 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
       val outer = new File(dir, "outer.tar")
       writeTar(outer, Seq(Entry("l2.tar", level2)))
 
-      def collectWithMaxDepth(maxDepth: Int): Seq[(String, String)] =
-        withSQLConf(SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH.key -> maxDepth.toString) {
-          collect(outer)
-        }
+      // The reader takes the limit from the Hadoop conf, where a session's SQL confs are copied.
+      def collectWithMaxDepth(maxDepth: Int): Seq[(String, String)] = {
+        val conf = new Configuration()
+        conf.setInt(SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH.key, maxDepth)
+        collect(outer, conf)
+      }
 
       val path = new Path(outer.toURI).toString
       // Three levels are readable at the limit, and the innermost is refused one below it.

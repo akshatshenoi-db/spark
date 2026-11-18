@@ -685,7 +685,8 @@ object ParquetFileFormat extends Logging {
             ExceptionUtils.getThrowables(e).exists(_.isInstanceOf[FileNotFoundException]) =>
           logWarning(log"Skipped missing file: ${MDC(PATH, currentFile)}", e)
           Seq.empty
-        case e: RuntimeException if ignoreCorruptFiles =>
+        case e: RuntimeException if ignoreCorruptFiles &&
+            DataSourceUtils.shouldIgnoreCorruptFileException(e) =>
           logWarning(log"Skipped the footer in the corrupted file: ${MDC(PATH, currentFile)}", e)
           Seq.empty
         // A corrupt archive's failure arrives wrapped, not as a bare RuntimeException; a missing

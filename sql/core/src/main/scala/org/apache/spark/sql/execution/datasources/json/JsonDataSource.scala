@@ -353,7 +353,8 @@ object MultiLineJsonDataSource extends JsonDataSource {
         logWarning(log"Skipped missing input: ${MDC(PATH, inputPath)}", e)
         Iterator.empty
       case e: FileNotFoundException => throw e
-      case e @ (_: RuntimeException | _: IOException) if ignoreCorruptFiles =>
+      case e @ (_: RuntimeException | _: IOException) if ignoreCorruptFiles &&
+          DataSourceUtils.shouldIgnoreCorruptFileException(e) =>
         logWarning(log"Skipped the corrupted input: ${MDC(PATH, inputPath)}", e)
         Iterator.empty
       case NonFatal(e) =>

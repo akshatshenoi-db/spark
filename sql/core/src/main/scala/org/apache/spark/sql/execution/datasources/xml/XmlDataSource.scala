@@ -431,7 +431,8 @@ object MultiLineXmlDataSource extends XmlDataSource {
       case NonFatal(e) =>
         Utils.getRootCause(e) match {
           case root @ (_: AccessControlException | _: BlockMissingException) => throw root
-          case _: RuntimeException | _: IOException if ignoreCorruptFiles =>
+          case root @ (_: RuntimeException | _: IOException) if ignoreCorruptFiles &&
+              DataSourceUtils.shouldIgnoreCorruptFileException(root) =>
             logWarning("Skipped the rest of the content in the corrupted file", e)
             Iterator.empty[String]
           case other => throw other

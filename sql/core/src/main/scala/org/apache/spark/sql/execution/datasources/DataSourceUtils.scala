@@ -27,7 +27,7 @@ import org.apache.hadoop.fs.Path
 import org.json4s.{Formats, NoTypeHints}
 import org.json4s.jackson.Serialization
 
-import org.apache.spark.{SparkException, SparkUpgradeException}
+import org.apache.spark.{SparkException, SparkThrowable, SparkUpgradeException}
 import org.apache.spark.sql.{sources, SPARK_LEGACY_DATETIME_METADATA_KEY, SPARK_LEGACY_INT96_METADATA_KEY, SPARK_TIMEZONE_METADATA_KEY, SPARK_VERSION_METADATA_KEY}
 import org.apache.spark.sql.catalyst.FileSourceOptions
 import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogUtils}
@@ -270,6 +270,9 @@ object DataSourceUtils extends PredicateHelper {
   }
 
   def shouldIgnoreCorruptFileException(e: Throwable): Boolean = e match {
+    // A resource-safety limit is not a corrupt file: skipping the input would return partial data
+    // with no signal that the limit stopped the read.
+    case st: SparkThrowable if st.getCondition == "MAX_ARCHIVE_DEPTH_EXCEEDED" => false
     case _: RuntimeException | _: IOException | _: InternalError => true
     case _ => false
   }

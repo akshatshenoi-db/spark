@@ -303,7 +303,8 @@ private[sql] object AvroUtils extends Logging {
       case _: FileNotFoundException if ignoreMissingFiles =>
         logWarning(log"Skipped missing archive: ${MDC(PATH, path)}")
         None
-      case e @ (_: RuntimeException | _: IOException) if ignoreCorruptFiles =>
+      case e @ (_: RuntimeException | _: IOException) if ignoreCorruptFiles &&
+          DataSourceUtils.shouldIgnoreCorruptFileException(e) =>
         logWarning(log"Skipped the corrupted archive: ${MDC(PATH, path)}", e)
         None
     }

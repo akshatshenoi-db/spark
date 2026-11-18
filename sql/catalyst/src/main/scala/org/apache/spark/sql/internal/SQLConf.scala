@@ -3590,7 +3590,7 @@ object SQLConf {
       .doc("Maximum number of archive levels an archive reader opens. The top-level archive is " +
         "depth 1, so 2 admits one level of nesting. Reading an archive nested deeper than " +
         "this limit fails, guarding against zip bombs and cyclic archives.")
-      .version("5.0.0")
+      .version("4.5.0")
       .withBindingPolicy(ConfigBindingPolicy.SESSION)
       .intConf
       .checkValue(_ >= 1, "The max archive nesting depth must be at least 1.")

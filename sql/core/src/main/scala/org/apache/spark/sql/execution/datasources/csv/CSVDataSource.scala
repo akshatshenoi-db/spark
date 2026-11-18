@@ -202,7 +202,8 @@ abstract class CSVDataSource extends Serializable with Logging with SupportsArch
             logWarning(log"Skipped missing input: ${MDC(PATH, stream.getPath())}", e)
             Iterator.empty
           case e: FileNotFoundException => throw e
-          case e @ (_: RuntimeException | _: IOException) if parsedOptions.ignoreCorruptFiles =>
+          case e @ (_: RuntimeException | _: IOException) if parsedOptions.ignoreCorruptFiles &&
+              DataSourceUtils.shouldIgnoreCorruptFileException(e) =>
             logWarning(log"Skipped the corrupted input: ${MDC(PATH, stream.getPath())}", e)
             Iterator.empty
           case NonFatal(e) =>

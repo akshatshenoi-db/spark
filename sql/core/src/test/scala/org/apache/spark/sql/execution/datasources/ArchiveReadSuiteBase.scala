@@ -600,6 +600,33 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
     }
   }
 
+  if (supportsSchemaInference) {
+    test("the depth limit still fails schema inference under ignoreCorruptFiles") {
+      val ext = archiveExtensions.head
+      val level2 = archiveBytes(Seq(entryName(0) -> encodeFile(sampleDf((1, "Alice")))), ext)
+      withArchiveFile() { archive =>
+        writeArchive(archive, Seq(s"level2.$ext" -> level2))
+        withSQLConf(
+            SQLConf.IGNORE_CORRUPT_FILES.key -> "true",
+            SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH.key -> "1") {
+          val e = intercept[Exception](inferredSchema(Seq(archive.getCanonicalPath)))
+          // Some formats report the depth error itself; others wrap it in a file-read failure.
+          val depthError = Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null)
+            .collectFirst {
+              case t: SparkRuntimeException if t.getCondition == "MAX_ARCHIVE_DEPTH_EXCEEDED" => t
+            }
+          checkError(
+            exception = depthError.getOrElse(fail(s"expected the depth limit error, got $e")),
+            condition = "MAX_ARCHIVE_DEPTH_EXCEEDED",
+            parameters = Map(
+              "entry" -> s"level2.$ext",
+              "path" -> new Path(archive.toURI).toString,
+              "maxDepth" -> "1"))
+        }
+      }
+    }
+  }
+
   Seq(true, false).foreach { ignoreCorrupt =>
     test(s"ignoreCorruptFiles=$ignoreCorrupt controls skipping a corrupt nested archive") {
       // The nested entry is a corrupt archive of corruptArchiveExtension, so recursing into it

@@ -469,7 +469,10 @@ object SupportsArchiveFormat {
       ignoredPathSegmentRegex: Pattern = HadoopFSUtils.defaultIgnoredPathSegmentRegexPattern,
       archivePathFilter: Option[GlobPattern])(
       parseEntry: (ArchiveEntry, InputStream) => Iterator[T]): Iterator[T] = {
-    val maxDepth = SQLConf.get.getConf(SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH)
+    // Read from `conf`, which carries the session's SQL confs, rather than `SQLConf.get`: schema
+    // inference also opens archives on threads and in jobs the session conf does not reach.
+    val maxDepth = conf.getInt(SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH.key,
+      SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH.defaultValue.get)
     streamEntries(
       openArchiveStream(path, conf), path, conf, "", 1, maxDepth,
       ignoredPathSegmentRegex, archivePathFilter)(parseEntry)
