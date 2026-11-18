@@ -78,9 +78,10 @@ class FileSourceOptions(
 
   /**
    * Glob selecting which inner archive entries to read, matched against each entry's full path
-   * within the archive (e.g. `subdir/*`, `*/*.csv`). An empty value disables the filter, matching
-   * how an empty [[ignoredPathSegmentRegex]] is treated. Validated here so an invalid glob fails on
-   * the driver.
+   * within the archive (e.g. `subdir/*`, `*/*.csv`). An entry of a nested archive is matched by its
+   * full `nested.tar!/entry` path; the nested archive itself is opened whatever the glob. An empty
+   * value disables the filter, matching how an empty [[ignoredPathSegmentRegex]] is treated.
+   * Validated here so an invalid glob fails on the driver.
    */
   val archivePathFilter: Option[String] = {
     val glob = parameters.get(ARCHIVE_PATH_FILTER).filter(_.nonEmpty)

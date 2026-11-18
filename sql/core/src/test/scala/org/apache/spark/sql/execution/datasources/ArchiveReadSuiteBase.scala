@@ -499,6 +499,23 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("archivePathFilter matches an entry of a nested archive by its full path") {
+    val ext = archiveExtensions.head
+    val innerBytes = archiveBytes(Seq(
+      s"keep.$fileExtension" -> encodeFile(sampleDf((2, "keep"))),
+      s"skip/other.$fileExtension" -> encodeFile(sampleDf((3, "skip")))), ext)
+    withArchiveFile() { archive =>
+      writeArchive(archive, Seq(
+        s"top.$fileExtension" -> encodeFile(sampleDf((1, "top"))),
+        s"nested.$ext" -> innerBytes))
+      // The nested archive is opened whatever the glob, which then selects among its entries.
+      checkAnswer(
+        read(archive.getCanonicalPath, Map("archivePathFilter" -> s"nested.$ext!/keep.*"))
+          .select("id", "name"),
+        Seq(Row(2, "keep")))
+    }
+  }
+
   test("the depth limit bounds how deeply nested archives are read") {
     val data = sampleDf((1, "Alice"), (2, "Bob"))
     val ext = archiveExtensions.head
@@ -548,7 +565,8 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
         entryName(1) -> encodeFile(sampleDf((2, "Bob")))))
       val before = nestedDirs()
       val entries = SupportsArchiveFormat.readArchiveEntries(
-        new Path(archive.toURI), spark.sessionState.newHadoopConf()) { (entry, _) =>
+        new Path(archive.toURI), spark.sessionState.newHadoopConf(),
+        archivePathFilter = None) { (entry, _) =>
         Iterator.single(entry.getName)
       }
       assert(entries.hasNext)

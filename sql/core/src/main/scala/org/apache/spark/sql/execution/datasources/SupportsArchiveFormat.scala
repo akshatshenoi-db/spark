@@ -428,6 +428,7 @@ object SupportsArchiveFormat {
    * reads match a loose-file scan.
    *
    * @param entry                   the archive entry to test
+   * @param namePrefix              prefix of the entry's full path, "" unless its archive is nested
    * @param ignoredPathSegmentRegex per-segment filter matched against each `/`-separated component
    * @param archivePathFilter       optional glob matched against the entry's full path
    * @return true if the entry is a directory, any path component is filtered out, or the entry's
@@ -435,11 +436,16 @@ object SupportsArchiveFormat {
    */
   private def shouldSkipEntry(
       entry: ArchiveEntry,
+      namePrefix: String,
       ignoredPathSegmentRegex: Pattern,
       archivePathFilter: Option[GlobPattern]): Boolean = {
     if (entry.isDirectory) return true
-    if (archivePathFilter.exists(!_.matches(entry.getName))) return true
-    entry.getName.split("/").exists(c =>
+    val name = entry.getName
+    // A nested archive is a container, like a directory: the glob selects the entries inside it.
+    if (!isArchiveFileName(name) && archivePathFilter.exists(!_.matches(namePrefix + name))) {
+      return true
+    }
+    name.split("/").exists(c =>
       c.nonEmpty && HadoopFSUtils.shouldFilterOutPathName(c, ignoredPathSegmentRegex))
   }
 
@@ -452,7 +458,8 @@ object SupportsArchiveFormat {
    * @param ignoredPathSegmentRegex per-segment filter for entries to skip (defaults to the
    *                                `InMemoryFileIndex` filter); pass a custom one to match a
    *                                loose-file scan
-   * @param archivePathFilter       optional glob matched against the entry's full path
+   * @param archivePathFilter       optional glob matched against the entry's full path, which for
+   *                                an entry of a nested archive is its `outer!/inner` name
    * @param parseEntry              turns one entry's `(entry, stream)` into an iterator of results
    * @return the concatenated results across kept entries, lazily one entry at a time
    */
@@ -465,7 +472,7 @@ object SupportsArchiveFormat {
     val maxDepth = SQLConf.get.getConf(SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH)
     streamEntries(
       openArchiveStream(path, conf), path, conf, "", 1, maxDepth,
-      ignoredPathSegmentRegex)(parseEntry)
+      ignoredPathSegmentRegex, archivePathFilter)(parseEntry)
   }
 
   /**
@@ -486,7 +493,8 @@ object SupportsArchiveFormat {
       namePrefix: String,
       depth: Int,
       maxDepth: Int,
-      ignoredPathSegmentRegex: Pattern)(
+      ignoredPathSegmentRegex: Pattern,
+      archivePathFilter: Option[GlobPattern])(
       parseEntry: (ArchiveEntry, InputStream) => Iterator[T]): Iterator[T] = {
     var closed = false
 
@@ -515,7 +523,8 @@ object SupportsArchiveFormat {
           var next: (ArchiveEntry, InputStream) = null
           while (next == null && archive.hasNext) {
             val entry = archive.next()
-            if (!shouldSkipEntry(entry._1, ignoredPathSegmentRegex, archivePathFilter)) {
+            if (!shouldSkipEntry(
+                entry._1, namePrefix, ignoredPathSegmentRegex, archivePathFilter)) {
               next = entry
             }
           }
@@ -534,7 +543,7 @@ object SupportsArchiveFormat {
               streamEntries(
                 openNestedArchiveStream(next._1.getName, stream, conf),
                 path, conf, s"${entry.getName}!/", depth + 1, maxDepth,
-                ignoredPathSegmentRegex)(parseEntry)
+                ignoredPathSegmentRegex, archivePathFilter)(parseEntry)
             } else {
               parseEntry(entry, stream)
             }

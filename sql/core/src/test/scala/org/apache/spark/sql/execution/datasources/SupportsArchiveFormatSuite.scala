@@ -763,6 +763,20 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("readArchiveEntries: archivePathFilter matches a nested entry by its full path") {
+    withTempDir { dir =>
+      val inner = archiveBytes(dir, "inner.zip", writeZip,
+        Seq(textEntry("a.csv", "a"), textEntry("sub/b.json", "b")))
+      val outer = new File(dir, "outer.tar")
+      writeTar(outer, Seq(textEntry("top.csv", "top"), Entry("inner.zip", inner)))
+      // The nested archive is opened whatever the glob; the glob selects among its entries.
+      assert(collectFiltered(outer, "*.csv") == Seq("top.csv", "inner.zip!/a.csv"))
+      assert(collectFiltered(outer, "inner.zip!/*") ==
+        Seq("inner.zip!/a.csv", "inner.zip!/sub/b.json"))
+      assert(collectFiltered(outer, "top.csv") == Seq("top.csv"))
+    }
+  }
+
   test("readArchiveEntries: recursion past the depth limit throws a clear error") {
     withTempDir { dir =>
       val level3 = archiveBytes(dir, "l3.tar", writeTar, Seq(textEntry("leaf.csv", "deep")))
