@@ -19,10 +19,11 @@ package org.apache.spark.sql.execution.datasources
 
 import java.io.File
 import java.nio.file.Files
+import java.util.regex.Pattern
 
 import org.apache.hadoop.fs.Path
 
-import org.apache.spark.{SparkConf, SparkException, SparkRuntimeException}
+import org.apache.spark.{SparkConf, SparkException, SparkRuntimeException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.{DataFrame, QueryTest, Row}
 import org.apache.spark.sql.functions.{col, input_file_name, struct}
 import org.apache.spark.sql.internal.SQLConf
@@ -167,6 +168,17 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
    * override it to false.
    */
   protected def supportsSchemaMerge: Boolean = true
+
+  /**
+   * Whether this format accepts the `decompression` read option. It does not mean archives
+   * support the option: a format that accepts it must reject it for archive inputs, failing with
+   * `UNSUPPORTED_FEATURE.DECOMPRESSION_CODEC_FOR_ARCHIVE`, since an archive is always decoded based
+   * on its file name extension. Gates the shared tests that assert that rejection. CSV, JSON and
+   * XML set it true; formats that ignore the option (e.g. Parquet, ORC, Avro) keep the default,
+   * because their archive reads succeed with it set. Text has its own archive base,
+   * [[TextArchiveReadBase]], with the same test.
+   */
+  protected def supportsDecompressionCodec: Boolean = false
 
   /**
    * Whether default (non-merge) inference samples a single file rather than scanning every input.
@@ -384,6 +396,56 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
     }
   }
 
+  // ----- shared archivePathFilter tests --------------------------------------
+
+  test("archivePathFilter selects inner entries by full path") {
+    withArchiveFile() { archive =>
+      writeArchive(archive, Seq(
+        s"top.$fileExtension" -> encodeFile(sampleDf((1, "top"))),
+        s"sub/keep.$fileExtension" -> encodeFile(sampleDf((2, "keep"))),
+        s"other/skip.$fileExtension" -> encodeFile(sampleDf((3, "skip")))))
+      // `sub/*` matches the full inner path, so only the entry under `sub/` is ingested.
+      checkAnswer(
+        read(archive.getCanonicalPath, Map("archivePathFilter" -> "sub/*")).select("id", "name"),
+        Seq(Row(2, "keep")))
+    }
+  }
+
+  test("archivePathFilter with an extension glob selects across subdirectories") {
+    withArchiveFile() { archive =>
+      writeArchive(archive, Seq(
+        s"top.$fileExtension" -> encodeFile(sampleDf((1, "top"))),
+        s"sub/nested.$fileExtension" -> encodeFile(sampleDf((2, "nested"))),
+        "sub/skip.other" -> encodeFile(sampleDf((3, "skip")))))
+      // `*` crosses `/`, so the glob keeps both entries of this extension at any depth, while the
+      // entry with a different extension is filtered out.
+      checkAnswer(
+        read(archive.getCanonicalPath, Map("archivePathFilter" -> s"*.$fileExtension"))
+          .select("id", "name"),
+        Seq(Row(1, "top"), Row(2, "nested")))
+    }
+  }
+
+  test("archivePathFilter matching no entry yields no rows") {
+    withArchiveFile() { archive =>
+      writeArchive(archive, Seq(s"data.$fileExtension" -> encodeFile(sampleDf((1, "Alice")))))
+      checkAnswer(
+        read(archive.getCanonicalPath, Map("archivePathFilter" -> "nomatch/*")), Seq.empty[Row])
+    }
+  }
+
+  test("archivePathFilter applies in addition to ignoredPathSegmentRegex") {
+    withArchiveFile() { archive =>
+      writeArchive(archive, Seq(
+        s"keep/data.$fileExtension" -> encodeFile(sampleDf((1, "keep"))),
+        // Matches the glob, but the hidden-file filter still drops the `_`-prefixed entry.
+        s"keep/_hidden.$fileExtension" -> encodeFile(sampleDf((2, "hidden")))))
+      checkAnswer(
+        read(archive.getCanonicalPath, Map("archivePathFilter" -> "keep/*")).select("id", "name"),
+        Seq(Row(1, "keep")))
+    }
+  }
+
   // ----- nested-archive tests ------------------------------------------------
 
   test("a nested archive is recursed into and reads like a directory of its entries") {
@@ -540,6 +602,21 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
   // ----- shared schema-inference tests (run when `supportsSchemaInference`) --
 
   if (supportsSchemaInference) {
+    test("archivePathFilter applies to schema inference, not just the scan") {
+      // The excluded entry carries a column the kept entry lacks. Inference must skip it, otherwise
+      // the inferred schema is a superset of what the scan returns and `extra` reads back all-null.
+      withArchiveFile() { archive =>
+        writeArchive(archive, Seq(
+          s"keep/data.$fileExtension" -> encodeFile(sampleDf((1, "keep"))),
+          s"skip/data.$fileExtension" ->
+            encodeFile(Seq((2, "skip", "x")).toDF("id", "name", "extra"))))
+        val schema = inferredSchema(
+          Seq(archive.getCanonicalPath), Map("archivePathFilter" -> "keep/*"))
+        assert(!schema.fieldNames.contains("extra"),
+          s"inference read a filtered-out entry; got $schema")
+      }
+    }
+
     test("archive infers the same schema as a directory of the same files") {
       val entries = Seq(sampleDf((1, "Alice"), (2, "Bob")), sampleDf((3, "Carol")))
         .zipWithIndex.map { case (p, i) => entryName(i) -> encodeFile(p) }
@@ -817,6 +894,43 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
     }
   }
 
+  // ----- shared parent-archive _metadata test --------------------------------
+
+  test("_metadata exposes the parent archive file's values, identical for every row") {
+    archiveExtensions.foreach { ext =>
+      withArchiveFile(ext) { archive =>
+        // Multiple entries, each multiple rows: the archive is one non-splittable PartitionedFile,
+        // so every row must carry the same parent-archive metadata (not any inner entry's).
+        val parts = Seq(sampleDf((1, "Alice"), (2, "Bob")), sampleDf((3, "Carol"), (4, "Dan")))
+        writeArchive(
+          archive, parts.zipWithIndex.map { case (p, i) => entryName(i) -> encodeFile(p) })
+
+        val rows = read(archive.getCanonicalPath)
+          .select("_metadata.file_path", "_metadata.file_name", "_metadata.file_size",
+            "_metadata.file_block_start", "_metadata.file_block_length",
+            "_metadata.file_modification_time")
+          .collect()
+        assert(rows.length == parts.map(_.count()).sum,
+          s"expected one row per input record, got ${rows.length}")
+
+        val fileSize = archive.length()
+        rows.foreach { r =>
+          assert(r.getString(0).endsWith(archive.getName) && !r.getString(0).contains(entryName(0)),
+            s"file_path should be the archive file, got ${r.getString(0)}")
+          assert(r.getString(1) == archive.getName, s"file_name mismatch: ${r.getString(1)}")
+          assert(r.getLong(2) == fileSize, s"file_size mismatch: ${r.getLong(2)} != $fileSize")
+          assert(r.getLong(3) == 0L, s"file_block_start should be 0, got ${r.getLong(3)}")
+          assert(r.getLong(4) == fileSize,
+            s"file_block_length should be the archive size, got ${r.getLong(4)}")
+          assert(r.getAs[java.sql.Timestamp](5).getTime == archive.lastModified(),
+            "file_modification_time should be the archive's mtime")
+        }
+        assert(rows.map(_.toSeq).distinct.length == 1,
+          "every row must carry the same parent-archive metadata")
+      }
+    }
+  }
+
   // ----- shared complex-type test (run when `supportsComplexTypes`) ----------
 
   if (supportsComplexTypes) {
@@ -824,6 +938,68 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
       assertArchiveMatchesDir(
         Seq(entryName(0) -> encodeFile(complexSampleDf)),
         schema = complexReadSchema)
+    }
+  }
+
+  // ----- shared `decompression` tests (run when `supportsDecompressionCodec`) -----
+
+  if (supportsDecompressionCodec) {
+    Seq(true, false).foreach { ignoreCorrupt =>
+      test("decompression is rejected for an archive " +
+          s"(ignoreCorruptFiles=$ignoreCorrupt)") {
+        archiveExtensions.foreach { ext =>
+          withArchiveFile(ext) { archive =>
+            writeArchive(archive, Seq(entryName(0) -> encodeFile(sampleDf((1, "Alice")))))
+            // Raised while planning the scan, so `ignoreCorruptFiles` cannot skip the archive.
+            withSQLConf(SQLConf.IGNORE_CORRUPT_FILES.key -> ignoreCorrupt.toString) {
+              checkErrorMatchPVals(
+                exception = intercept[SparkUnsupportedOperationException] {
+                  read(archive.getCanonicalPath, Map("decompression" -> "gzip")).collect()
+                },
+                condition = "UNSUPPORTED_FEATURE.DECOMPRESSION_CODEC_FOR_ARCHIVE",
+                parameters = Map(
+                  "option" -> "\"decompression\"",
+                  "path" -> s".*${Pattern.quote(archive.getName)}"))
+            }
+          }
+        }
+      }
+    }
+
+    test("decompression is rejected for an archive among loose files") {
+      withTempDir { dir =>
+        writeArchive(
+          new File(dir, s"data.${archiveExtensions.head}"),
+          Seq(entryName(0) -> encodeFile(sampleDf((1, "Alice")))))
+        Files.write(new File(dir, entryName(1)).toPath, encodeFile(sampleDf((2, "Bob"))))
+        val e = intercept[SparkUnsupportedOperationException] {
+          read(dir.getCanonicalPath, Map("decompression" -> "none")).collect()
+        }
+        assert(e.getCondition == "UNSUPPORTED_FEATURE.DECOMPRESSION_CODEC_FOR_ARCHIVE")
+      }
+    }
+
+    if (supportsSchemaInference) {
+      Seq(true, false).foreach { ignoreCorrupt =>
+        test("decompression is rejected for an archive during schema inference " +
+            s"(ignoreCorruptFiles=$ignoreCorrupt)") {
+          withArchiveFile() { archive =>
+            writeArchive(archive, Seq(entryName(0) -> encodeFile(sampleDf((1, "Alice")))))
+            // Raised on the driver before any inference task opens the archive, so it is neither
+            // wrapped in a task failure nor skipped by `ignoreCorruptFiles`.
+            withSQLConf(SQLConf.IGNORE_CORRUPT_FILES.key -> ignoreCorrupt.toString) {
+              checkErrorMatchPVals(
+                exception = intercept[SparkUnsupportedOperationException] {
+                  inferredSchema(Seq(archive.getCanonicalPath), Map("decompression" -> "gzip"))
+                },
+                condition = "UNSUPPORTED_FEATURE.DECOMPRESSION_CODEC_FOR_ARCHIVE",
+                parameters = Map(
+                  "option" -> "\"decompression\"",
+                  "path" -> s".*${Pattern.quote(archive.getName)}"))
+            }
+          }
+        }
+      }
     }
   }
 }

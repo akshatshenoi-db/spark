@@ -83,7 +83,7 @@ class ExpressionInfoSuite extends SharedSparkSession {
 
     val validSources = Seq(
       "built-in", "hive", "python_udf", "scala_udf", "java_udf", "python_udtf", "internal",
-      "sql_udf")
+      "sql_udf", "v2_function")
     validSources.foreach { source =>
       val info = new ExpressionInfo(
         "testClass", null, "testName", null, "", "", "", "", "", "", source)
@@ -248,9 +248,12 @@ class ExpressionInfoSuite extends SharedSparkSession {
       "org.apache.spark.sql.catalyst.expressions.CurrentDate",
       "org.apache.spark.sql.catalyst.expressions.CurDateExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.CurrentTimestamp",
+      "org.apache.spark.sql.catalyst.expressions.CurrentTimestampExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.CurrentTimeZone",
       "org.apache.spark.sql.catalyst.expressions.Now",
+      "org.apache.spark.sql.catalyst.expressions.NowExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.LocalTimestamp",
+      "org.apache.spark.sql.catalyst.expressions.LocalTimestampExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.CurrentTime",
       // Random output without a seed
       "org.apache.spark.sql.catalyst.expressions.Rand",
@@ -289,6 +292,8 @@ class ExpressionInfoSuite extends SharedSparkSession {
       val clonedSpark = spark.cloneSession()
       // Coalescing partitions can change result order, so disable it.
       clonedSpark.conf.set(SQLConf.COALESCE_PARTITIONS_ENABLED.key, false)
+      // parse_sql examples require the experimental feature flag.
+      clonedSpark.conf.set(SQLConf.PARSE_SQL_ENABLED.key, true)
       val info = clonedSpark.sessionState.catalog.lookupFunctionInfo(funcId)
       val className = info.getClassName
       if (!ignoreSet.contains(className)) {

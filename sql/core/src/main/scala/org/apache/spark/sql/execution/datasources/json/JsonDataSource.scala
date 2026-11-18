@@ -23,7 +23,7 @@ import scala.util.control.NonFatal
 
 import com.fasterxml.jackson.core.{JsonFactory, JsonParser}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hadoop.fs.{FileStatus, GlobPattern, Path}
 import org.apache.hadoop.io.Text
 import org.apache.hadoop.mapreduce.Job
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat
@@ -35,9 +35,9 @@ import org.apache.spark.internal.LogKeys.PATH
 import org.apache.spark.paths.SparkPath
 import org.apache.spark.rdd.{BinaryFileRDD, RDD}
 import org.apache.spark.sql.{Dataset, Encoders, SparkSession}
-import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.{FileSourceOptions, InternalRow}
 import org.apache.spark.sql.catalyst.json.{CreateJacksonParser, JacksonParser, JsonInferSchema, JSONOptions}
-import org.apache.spark.sql.catalyst.util.FailureSafeParser
+import org.apache.spark.sql.catalyst.util.{CompressionCodecs, FailureSafeParser}
 import org.apache.spark.sql.classic.ClassicConversions.castToImpl
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.SQLExecution
@@ -84,13 +84,16 @@ abstract class JsonDataSource extends Serializable with Logging with SupportsArc
    * and is intentionally left untouched.
    *
    * @param parser builds a fresh JSON parser for each entry.
+   * @param archivePathFilter optional glob matched against the entry's full path
    */
   def readArchive(
       conf: Configuration,
       file: PartitionedFile,
       parser: () => JacksonParser,
-      schema: StructType): Iterator[InternalRow] =
-    SupportsArchiveFormat.readArchiveEntries(file.toPath, conf) { (_, in) =>
+      schema: StructType,
+      archivePathFilter: Option[GlobPattern]): Iterator[InternalRow] =
+    SupportsArchiveFormat.readArchiveEntries(
+        file.toPath, conf, archivePathFilter = archivePathFilter) { (_, in) =>
       readStream(in, parser(), schema)
     }
 
@@ -145,6 +148,9 @@ object JsonDataSource {
     val job = Job.getInstance(sparkSession.sessionState.newHadoopConfWithOptions(
       parsedOptions.parameters))
     val conf = job.getConfiguration
+    // Honor the `decompression` option during multiLine schema inference too, so the codec is
+    // forced rather than inferred from the file name extension.
+    CompressionCodecs.setReadCodecConfiguration(conf, parsedOptions.decompressionCodec)
     val name = paths.mkString(",")
     FileInputFormat.setInputPaths(job, paths: _*)
     new BinaryFileRDD(
@@ -178,7 +184,8 @@ object TextInputJsonDataSource extends JsonDataSource {
     val sampled: Dataset[String] = JsonUtils.sample(json, parsedOptions)
     val rdd: RDD[InternalRow] = sampled.queryExecution.toRdd
     val rowParser = parsedOptions.encoding.map { enc =>
-      CreateJacksonParser.internalRow(enc, _: JsonFactory, _: InternalRow)
+      CreateJacksonParser.internalRow(enc, parsedOptions.legacyJavaCharsets,
+        parsedOptions.legacyCodingErrorAction, _: JsonFactory, _: InternalRow)
     }.getOrElse(CreateJacksonParser.internalRow(_: JsonFactory, _: InternalRow))
 
     SQLExecution.withSQLConfPropagated(json.sparkSession) {
@@ -210,7 +217,8 @@ object TextInputJsonDataSource extends JsonDataSource {
     )
     Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => linesReader.close()))
     val textParser = parser.options.encoding
-      .map(enc => CreateJacksonParser.text(enc, _: JsonFactory, _: Text))
+      .map(enc => CreateJacksonParser.text(enc, parser.options.legacyJavaCharsets,
+        parser.options.legacyCodingErrorAction, _: JsonFactory, _: Text))
       .getOrElse(CreateJacksonParser.text(_: JsonFactory, _: Text))
 
     val safeParser = new FailureSafeParser[Text](
@@ -226,7 +234,8 @@ object TextInputJsonDataSource extends JsonDataSource {
       parser: JacksonParser,
       schema: StructType): Iterator[InternalRow] = {
     val textParser = parser.options.encoding
-      .map(enc => CreateJacksonParser.text(enc, _: JsonFactory, _: Text))
+      .map(enc => CreateJacksonParser.text(enc, parser.options.legacyJavaCharsets,
+        parser.options.legacyCodingErrorAction, _: JsonFactory, _: Text))
       .getOrElse(CreateJacksonParser.text(_: JsonFactory, _: Text))
 
     val safeParser = new FailureSafeParser[Text](
@@ -283,23 +292,37 @@ object MultiLineJsonDataSource extends JsonDataSource {
       sparkSession: SparkSession,
       inputPaths: Seq[FileStatus],
       parsedOptions: JSONOptions): StructType = {
+    SupportsArchiveFormat.checkNoDecompressionCodecForArchives(
+      inputPaths, parsedOptions.decompressionCodec)
     val baseRdd = JsonDataSource.createBaseRdd(sparkSession, inputPaths, parsedOptions)
+    // Inference must see the same entries the scan reads, so it honors archivePathFilter too.
+    // Capture the glob string: the compiled GlobPattern is not serializable, so each task
+    // compiles it once when the archive branch is taken.
+    val archivePathFilterGlob = parsedOptions.archivePathFilter
     val encoding = parsedOptions.encoding
     val ignoreCorruptFiles = parsedOptions.ignoreCorruptFiles
     val ignoreMissingFiles = parsedOptions.ignoreMissingFiles
 
     // An archive entry's stream is only valid until the shared cursor advances, so each document
     // must be consumed before the next is pulled; `JsonInferSchema.infer` does.
-    val docs: RDD[InputStream] = baseRdd.flatMap { stream =>
-      val path = new Path(stream.getPath())
-      skipInputOnError(stream.getPath(), ignoreMissingFiles, ignoreCorruptFiles) {
-        if (SupportsArchiveFormat.isArchivePath(path)) {
-          SupportsArchiveFormat.readArchiveEntries(path, stream.getConfiguration) { (_, in) =>
-            Iterator.single(in)
+    val docs: RDD[InputStream] = baseRdd.mapPartitions { streams =>
+      // Compile at most once per partition: lazy so a partition of only loose files never
+      // compiles, while a partition with archives reuses one matcher across all of them.
+      lazy val archivePathFilter =
+        archivePathFilterGlob.map(FileSourceOptions.compileArchivePathFilter)
+      streams.flatMap { stream =>
+        val path = new Path(stream.getPath())
+        skipInputOnError(stream.getPath(), ignoreMissingFiles, ignoreCorruptFiles) {
+          if (SupportsArchiveFormat.isArchivePath(path)) {
+            SupportsArchiveFormat.readArchiveEntries(
+              path, stream.getConfiguration, archivePathFilter = archivePathFilter) {
+              (_, in) =>
+              Iterator.single(in)
+            }
+          } else {
+            Iterator.single(
+              CodecStreams.createInputStreamWithCloseResource(stream.getConfiguration, path))
           }
-        } else {
-          Iterator.single(
-            CodecStreams.createInputStreamWithCloseResource(stream.getConfiguration, path))
         }
       }
     }
@@ -380,7 +403,7 @@ object MultiLineJsonDataSource extends JsonDataSource {
       file: PartitionedFile,
       parser: JacksonParser,
       schema: StructType): Iterator[InternalRow] = {
-    def partitionedFileString(ignored: Any): UTF8String = {
+    lazy val fileLiteral: UTF8String = {
       Utils.tryWithResource {
         Utils.createResourceUninterruptiblyIfInTaskThread {
           CodecStreams.createInputStreamWithCloseResource(conf, file.toPath)
@@ -389,6 +412,7 @@ object MultiLineJsonDataSource extends JsonDataSource {
         UTF8String.fromBytes(inputStream.readAllBytes())
       }
     }
+    def partitionedFileString(ignored: Any): UTF8String = fileLiteral
     val streamParser = parser.options.encoding
       .map(enc => CreateJacksonParser.inputStream(enc, _: JsonFactory, _: InputStream))
       .getOrElse(CreateJacksonParser.inputStream(_: JsonFactory, _: InputStream))
@@ -399,8 +423,14 @@ object MultiLineJsonDataSource extends JsonDataSource {
       schema,
       parser.options.columnNameOfCorruptRecord)
 
-    safeParser.parse(
-      CodecStreams.createInputStreamWithCloseResource(conf, file.toPath))
+    val input = CodecStreams.createInputStreamWithCloseResource(conf, file.toPath)
+    if (parser.options.streamMultilineTopLevelArray) {
+      safeParser.parseIterator(
+        input,
+        input => parser.parseIterator[InputStream](input, streamParser, partitionedFileString))
+    } else {
+      safeParser.parse(input)
+    }
   }
 
   override protected def readStream(
@@ -410,16 +440,25 @@ object MultiLineJsonDataSource extends JsonDataSource {
     // The entry is a single JSON document. Buffer its bytes so the corrupt-record column can echo
     // the whole document on a parse failure, mirroring `readFile`'s `partitionedFileString`.
     val bytes = in.readAllBytes()
+    lazy val documentLiteral: UTF8String = UTF8String.fromBytes(bytes)
     val streamParser = parser.options.encoding
       .map(enc => CreateJacksonParser.inputStream(enc, _: JsonFactory, _: InputStream))
       .getOrElse(CreateJacksonParser.inputStream(_: JsonFactory, _: InputStream))
 
     val safeParser = new FailureSafeParser[InputStream](
-      input => parser.parse[InputStream](input, streamParser, _ => UTF8String.fromBytes(bytes)),
+      input => parser.parse[InputStream](input, streamParser, _ => documentLiteral),
       parser.options.parseMode,
       schema,
       parser.options.columnNameOfCorruptRecord)
 
-    safeParser.parse(new ByteArrayInputStream(bytes))
+    val input = new ByteArrayInputStream(bytes)
+    if (parser.options.streamMultilineTopLevelArray) {
+      safeParser.parseIterator(
+        input,
+        input => parser.parseIterator[InputStream](
+          input, streamParser, _ => documentLiteral))
+    } else {
+      safeParser.parse(input)
+    }
   }
 }

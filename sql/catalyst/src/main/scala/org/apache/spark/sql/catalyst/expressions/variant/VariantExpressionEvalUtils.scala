@@ -76,6 +76,21 @@ object VariantExpressionEvalUtils {
   def isValidVariant(input: VariantVal): Boolean =
     VariantUtil.isValidVariant(input.getValue, input.getMetadata)
 
+  def canonicalizeVariant(input: VariantVal): VariantVal = {
+    val variant = new Variant(input.getValue, input.getMetadata)
+    val canonicalized = try {
+      VariantBuilder.canonicalize(variant)
+    } catch {
+      case _: VariantSizeLimitException =>
+        throw QueryExecutionErrors.variantConstructorSizeLimitError(VariantUtil.SIZE_LIMIT)
+    }
+    if (canonicalized eq variant) {
+      input
+    } else {
+      new VariantVal(canonicalized.getValue, canonicalized.getMetadata)
+    }
+  }
+
   /**
    * Parse a JSONPath for a variant manipulation function. Throws `INVALID_VARIANT_PATH` on a
    * malformed path, or on the empty (root `$`) path unless `allowRoot` is set (as
@@ -84,8 +99,9 @@ object VariantExpressionEvalUtils {
   def parseVariantPath(
       pathValue: String,
       functionName: String,
+      legacyPathBackslashAsLiteral: Boolean,
       allowRoot: Boolean = false): Array[VariantPathSegment] = {
-    val parsed = VariantPathParser.parse(pathValue).getOrElse {
+    val parsed = VariantPathParser.parse(pathValue, legacyPathBackslashAsLiteral).getOrElse {
       throw QueryExecutionErrors.invalidVariantPath(pathValue, functionName)
     }
     if (!allowRoot && parsed.isEmpty) {
@@ -95,7 +111,9 @@ object VariantExpressionEvalUtils {
   }
 
   /** Render a parsed path prefix back to a JSONPath string for error messages. */
-  private def renderVariantPath(segments: Array[VariantBuilder.PathSegment]): String = {
+  private def renderVariantPath(
+      segments: Array[VariantBuilder.PathSegment],
+      legacyPathBackslashAsLiteral: Boolean): String = {
     val sb = new StringBuilder("$")
     segments.foreach {
       case o: VariantBuilder.ObjectKeySegment =>
@@ -104,10 +122,13 @@ object VariantExpressionEvalUtils {
         // must use bracket notation so the rendered path round-trips to the same segments.
         if (key.nonEmpty && !key.contains('.') && !key.contains('[')) {
           sb.append('.').append(key)
-        } else if (!key.contains('\'')) {
-          sb.append("['").append(key).append("']")
         } else {
-          sb.append("[\"").append(key).append("\"]")
+          val quote = if (key.contains('\'')) '"' else '\''
+          if (legacyPathBackslashAsLiteral) {
+            sb.append('[').append(quote).append(key).append(quote).append(']')
+          } else {
+            sb.append(VariantPathParser.quoteKey(key, quote))
+          }
         }
       case a: VariantBuilder.ArrayIndexSegment => sb.append('[').append(a.index).append(']')
     }
@@ -130,8 +151,12 @@ object VariantExpressionEvalUtils {
     new VariantVal(out.getValue, out.getMetadata)
   }
 
-  def deleteAtPath(input: VariantVal, path: UTF8String): VariantVal =
-    deleteAtPath(input, toJavaSegments(parseVariantPath(path.toString, "variant_delete")))
+  def deleteAtPath(
+      input: VariantVal,
+      path: UTF8String,
+      legacyPathBackslashAsLiteral: Boolean): VariantVal =
+    deleteAtPath(input, toJavaSegments(
+      parseVariantPath(path.toString, "variant_delete", legacyPathBackslashAsLiteral)))
 
   /**
    * Insert `value` into `input` at `javaSegments`. `path` is the source string used in error
@@ -148,7 +173,8 @@ object VariantExpressionEvalUtils {
       value: Any,
       valueDataType: DataType,
       functionName: String,
-      failOnError: Boolean): VariantVal = {
+      failOnError: Boolean,
+      legacyPathBackslashAsLiteral: Boolean): VariantVal = {
     val v = new Variant(input.getValue, input.getMetadata)
     try {
       val valVal = castToVariant(value, valueDataType)
@@ -161,7 +187,8 @@ object VariantExpressionEvalUtils {
         null
       case e: VariantPathTypeMismatchException =>
         throw QueryExecutionErrors.variantPathTypeMismatch(
-          path, renderVariantPath(javaSegments.take(e.depth)), functionName)
+          path, renderVariantPath(javaSegments.take(e.depth), legacyPathBackslashAsLiteral),
+          functionName)
       case _: VariantSizeLimitException =>
         throw QueryExecutionErrors.variantSizeLimitError(VariantUtil.SIZE_LIMIT, functionName)
     }
@@ -173,10 +200,13 @@ object VariantExpressionEvalUtils {
       value: Any,
       valueDataType: DataType,
       functionName: String,
-      failOnError: Boolean): VariantVal = {
+      failOnError: Boolean,
+      legacyPathBackslashAsLiteral: Boolean): VariantVal = {
     val pathStr = path.toString
-    val javaSegments = toJavaSegments(parseVariantPath(pathStr, functionName))
-    insertAtPath(input, javaSegments, pathStr, value, valueDataType, functionName, failOnError)
+    val javaSegments = toJavaSegments(
+      parseVariantPath(pathStr, functionName, legacyPathBackslashAsLiteral))
+    insertAtPath(input, javaSegments, pathStr, value, valueDataType, functionName, failOnError,
+      legacyPathBackslashAsLiteral)
   }
 
   /**
@@ -195,7 +225,8 @@ object VariantExpressionEvalUtils {
       valueDataType: DataType,
       createIfMissing: Boolean,
       functionName: String,
-      failOnError: Boolean): VariantVal = {
+      failOnError: Boolean,
+      legacyPathBackslashAsLiteral: Boolean): VariantVal = {
     val v = new Variant(input.getValue, input.getMetadata)
     try {
       val valVal = castToVariant(value, valueDataType)
@@ -206,7 +237,8 @@ object VariantExpressionEvalUtils {
       case _: VariantPathTypeMismatchException if !failOnError => null
       case e: VariantPathTypeMismatchException =>
         throw QueryExecutionErrors.variantPathTypeMismatch(
-          path, renderVariantPath(javaSegments.take(e.depth)), functionName)
+          path, renderVariantPath(javaSegments.take(e.depth), legacyPathBackslashAsLiteral),
+          functionName)
       case _: VariantSizeLimitException =>
         throw QueryExecutionErrors.variantSizeLimitError(VariantUtil.SIZE_LIMIT, functionName)
     }
@@ -219,11 +251,13 @@ object VariantExpressionEvalUtils {
       valueDataType: DataType,
       createIfMissing: Boolean,
       functionName: String,
-      failOnError: Boolean): VariantVal = {
+      failOnError: Boolean,
+      legacyPathBackslashAsLiteral: Boolean): VariantVal = {
     val pathStr = path.toString
-    val javaSegments = toJavaSegments(parseVariantPath(pathStr, functionName))
+    val javaSegments = toJavaSegments(
+      parseVariantPath(pathStr, functionName, legacyPathBackslashAsLiteral))
     setAtPath(input, javaSegments, pathStr, value, valueDataType, createIfMissing, functionName,
-      failOnError)
+      failOnError, legacyPathBackslashAsLiteral)
   }
 
   /**
@@ -241,7 +275,8 @@ object VariantExpressionEvalUtils {
       value: Any,
       valueDataType: DataType,
       functionName: String,
-      failOnError: Boolean): VariantVal = {
+      failOnError: Boolean,
+      legacyPathBackslashAsLiteral: Boolean): VariantVal = {
     val v = new Variant(input.getValue, input.getMetadata)
     try {
       val valVal = castToVariant(value, valueDataType)
@@ -252,7 +287,8 @@ object VariantExpressionEvalUtils {
       case _: VariantPathTypeMismatchException if !failOnError => null
       case e: VariantPathTypeMismatchException =>
         throw QueryExecutionErrors.variantPathTypeMismatch(
-          path, renderVariantPath(javaSegments.take(e.depth)), functionName)
+          path, renderVariantPath(javaSegments.take(e.depth), legacyPathBackslashAsLiteral),
+          functionName)
       case _: VariantSizeLimitException =>
         throw QueryExecutionErrors.variantSizeLimitError(VariantUtil.SIZE_LIMIT, functionName)
     }
@@ -264,10 +300,39 @@ object VariantExpressionEvalUtils {
       value: Any,
       valueDataType: DataType,
       functionName: String,
-      failOnError: Boolean): VariantVal = {
+      failOnError: Boolean,
+      legacyPathBackslashAsLiteral: Boolean): VariantVal = {
     val pathStr = path.toString
-    val javaSegments = toJavaSegments(parseVariantPath(pathStr, functionName, allowRoot = true))
-    arrayAppendAtPath(input, javaSegments, pathStr, value, valueDataType, functionName, failOnError)
+    val javaSegments = toJavaSegments(
+      parseVariantPath(pathStr, functionName, legacyPathBackslashAsLiteral, allowRoot = true))
+    arrayAppendAtPath(input, javaSegments, pathStr, value, valueDataType, functionName, failOnError,
+      legacyPathBackslashAsLiteral)
+  }
+
+  def stripNulls(input: VariantVal, includeArrays: Boolean): VariantVal = {
+    val v = new Variant(input.getValue, input.getMetadata)
+    val out = VariantBuilder.stripNulls(v, includeArrays)
+    new VariantVal(out.getValue, out.getMetadata)
+  }
+
+  def parsePickPath(
+      path: UTF8String,
+      legacyPathBackslashAsLiteral: Boolean): Array[VariantBuilder.PathSegment] =
+    toJavaSegments(parseVariantPath(
+      path.toString, "variant_pick", legacyPathBackslashAsLiteral, allowRoot = true))
+
+  def pickAtPaths(
+      input: VariantVal,
+      paths: java.util.List[Array[VariantBuilder.PathSegment]]): VariantVal = {
+    val v = new Variant(input.getValue, input.getMetadata)
+    val out = VariantBuilder.pickAtPaths(v, paths)
+    new VariantVal(out.getValue, out.getMetadata)
+  }
+
+  def pickAtPaths(input: VariantVal, tree: VariantBuilder.PickNode): VariantVal = {
+    val v = new Variant(input.getValue, input.getMetadata)
+    val out = VariantBuilder.pickAtPaths(v, tree)
+    new VariantVal(out.getValue, out.getMetadata)
   }
 
   /** Cast a Spark value from `dataType` into the variant type. */
@@ -276,6 +341,77 @@ object VariantExpressionEvalUtils {
     // keys.
     val builder = new VariantBuilder(false)
     buildVariant(builder, input, dataType)
+    val v = builder.result()
+    new VariantVal(v.getValue, v.getMetadata)
+  }
+
+  /**
+   * Build a variant object directly from a keys array and a values array, without materializing an
+   * intermediate map. Keys must be non-null strings and the two arrays must have equal length. A
+   * null key raises `NULL_MAP_KEY`, a duplicate key raises `VARIANT_DUPLICATE_KEY` (matching
+   * to_variant_object), and null values are kept as variant null.
+   */
+  def variantFromArrays(keys: ArrayData, values: ArrayData, valueType: DataType): VariantVal = {
+    if (keys.numElements() != values.numElements()) {
+      // Reuse the same error map_from_arrays raises for a keys/values length mismatch.
+      throw QueryExecutionErrors.mapDataKeyArrayLengthDiffersFromValueArrayLengthError()
+    }
+    val builder = new VariantBuilder(false)
+    val start = builder.getWritePos
+    val numElements = keys.numElements()
+    val fields = new java.util.ArrayList[VariantBuilder.FieldEntry](numElements)
+    var i = 0
+    while (i < numElements) {
+      if (keys.isNullAt(i)) {
+        throw QueryExecutionErrors.nullAsMapKeyNotAllowedError()
+      }
+      val key = keys.getUTF8String(i).toString
+      val id = builder.addKey(key)
+      fields.add(new VariantBuilder.FieldEntry(key, id, builder.getWritePos - start))
+      val value = if (values.isNullAt(i)) null else values.get(i, valueType)
+      buildVariant(builder, value, valueType)
+      i += 1
+    }
+    builder.finishWritingObject(start, fields)
+    val v = builder.result()
+    new VariantVal(v.getValue, v.getMetadata)
+  }
+
+  /**
+   * Build a variant object directly from an array of key/value struct entries, without an
+   * intermediate map. Keys must be non-null strings. A null entry makes the whole result null,
+   * and this is checked for every entry before any value is converted, so a null entry always
+   * dominates a conversion failure in an earlier entry (matching `map_from_entries`). A null key
+   * raises `NULL_MAP_KEY`, a duplicate key raises `VARIANT_DUPLICATE_KEY`, and null values are
+   * kept as variant null.
+   */
+  def variantFromEntries(entries: ArrayData, valueType: DataType): VariantVal = {
+    val numElements = entries.numElements()
+    var i = 0
+    while (i < numElements) {
+      if (entries.isNullAt(i)) {
+        return null
+      }
+      i += 1
+    }
+
+    val builder = new VariantBuilder(false)
+    val start = builder.getWritePos
+    val fields = new java.util.ArrayList[VariantBuilder.FieldEntry](numElements)
+    i = 0
+    while (i < numElements) {
+      val entry = entries.getStruct(i, 2)
+      if (entry.isNullAt(0)) {
+        throw QueryExecutionErrors.nullAsMapKeyNotAllowedError()
+      }
+      val key = entry.getUTF8String(0).toString
+      val id = builder.addKey(key)
+      fields.add(new VariantBuilder.FieldEntry(key, id, builder.getWritePos - start))
+      val value = if (entry.isNullAt(1)) null else entry.get(1, valueType)
+      buildVariant(builder, value, valueType)
+      i += 1
+    }
+    builder.finishWritingObject(start, fields)
     val v = builder.result()
     new VariantVal(v.getValue, v.getMetadata)
   }

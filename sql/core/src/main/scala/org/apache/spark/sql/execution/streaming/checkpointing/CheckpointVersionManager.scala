@@ -18,6 +18,7 @@
 package org.apache.spark.sql.execution.streaming.checkpointing
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.VERSION_NUM
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
@@ -35,6 +36,7 @@ case class StreamingCheckpointVersion(offsetLogVersion: Int) {
 
 sealed trait CheckpointLogType
 case object OffsetLogType extends CheckpointLogType
+case object CommitLogType extends CheckpointLogType
 
 /**
  * The `CheckpointVersionManager` is responsible for managing the versioning of the streaming
@@ -73,7 +75,7 @@ object CheckpointVersionManager extends Logging {
     val minRequiredVersion = getMinRequiredOffsetLogVersion(sparkSessionForStream)
     val configuredVersion = sparkSessionForStream.sessionState.conf.streamingOffsetLogFormatVersion
     val result = List[Int](currentDefaultVersion, minRequiredVersion, configuredVersion).max
-    logInfo(s"Retrieved offset log writer version=$result")
+    logInfo(log"Retrieved offset log writer version=${MDC(VERSION_NUM, result)}")
     result
   }
 
@@ -109,6 +111,35 @@ object CheckpointVersionManager extends Logging {
       logType: CheckpointLogType): Int = {
     logType match {
       case OffsetLogType => getOffsetLogVersion(sparkSessionForStream)
+      case CommitLogType => getCommitLogVersion(sparkSessionForStream)
+    }
+  }
+
+  /**
+   * The commit log format version requested by the session config.
+   * `streamingCommitLogFormatVersion` tracks [[SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION]]: a
+   * state store checkpoint format of v2 makes each batch write `stateUniqueIds`, which only a
+   * commit log at [[CommitLog.VERSION_2]] or above can persist, so a v2 state store format raises
+   * the commit log version to v2.
+   */
+  private def getCommitLogVersion(sparkSessionForStream: SparkSession): Int = {
+    val result = sparkSessionForStream.sessionState.conf.streamingCommitLogFormatVersion
+    logInfo(log"Retrieved commit log writer version=${MDC(VERSION_NUM, result)}")
+    result
+  }
+
+  /**
+   * Determines the commit log format version for ordinary writes in this query run. An existing
+   * checkpoint wins, so a session config change cannot start writing a format the checkpoint was
+   * not created with. Only a fresh checkpoint takes the version from the session config. Sink
+   * evolution may independently upgrade writes to [[CommitLog.VERSION_3]].
+   */
+  def resolveCommitLogVersion(
+      sparkSessionForStream: SparkSession,
+      latestCommittedBatch: Option[(Long, CommitMetadataBase)]): Int = {
+    latestCommittedBatch match {
+      case Some((_, commitMetadata)) => commitMetadata.version
+      case None => getFormatVersionFromSession(sparkSessionForStream, CommitLogType)
     }
   }
 
@@ -142,10 +173,38 @@ object CheckpointVersionManager extends Logging {
   def setFormatVersion(
       sparkSessionForStream: SparkSession,
       logType: CheckpointLogType,
-      version: Int): Unit = {
+      version: Int,
+      commitMetadata: Option[CommitMetadataBase] = None): Unit = {
     logType match {
       case OffsetLogType =>
         setSparkSessionConfigsForOffsetLog(sparkSessionForStream, version)
+      case CommitLogType =>
+        setSparkSessionConfigsForCommitLog(sparkSessionForStream, version, commitMetadata)
     }
+  }
+
+  /**
+   * Records the state store checkpoint format used by the existing commit log. VERSION_1 uses
+   * state store format v1 and VERSION_2 uses v2. VERSION_3 can represent either format because it
+   * was introduced independently for sink metadata; the presence of state store checkpoint ids
+   * distinguishes v2 from v1.
+   *
+   * The state store format is clamped to 2 rather than set to the commit log version, because the
+   * two version spaces are separate: the commit log has a VERSION_3 (sink metadata) with no state
+   * store counterpart, while the state store config accepts only versions 1 and 2. Writing 3 here
+   * would report a state store format that does not exist.
+   */
+  private def setSparkSessionConfigsForCommitLog(
+      sparkSessionForStream: SparkSession,
+      commitLogFormatVersion: Int,
+      commitMetadata: Option[CommitMetadataBase]): Unit = {
+    val stateStoreVersion = commitMetadata match {
+      case Some(metadata) if metadata.version == CommitLog.VERSION_3 =>
+        if (metadata.stateUniqueIds.isDefined) 2 else 1
+      case _ =>
+        if (commitLogFormatVersion >= CommitLog.VERSION_2) 2 else 1
+    }
+    sparkSessionForStream.conf
+      .set(SQLConf.STATE_STORE_CHECKPOINT_FORMAT_VERSION.key, stateStoreVersion.toString)
   }
 }

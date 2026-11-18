@@ -465,6 +465,50 @@ object ArrowCacheBenchmark extends SqlBasedBenchmark {
     }
   }
 
+  private def cacheShuffledQuery(): Unit = {
+    val numRows = 5000000 // 5M rows
+    // AQE plans a cached query that has an exchange. For a serializer that takes columnar input,
+    // like the Arrow one, its rows then reach the cache through RowToColumnarExec at the end of
+    // the cached plan, a path that the other sections do not take: their queries have no exchange,
+    // or read Parquet, which is columnar already. The Default serializer takes rows. Each case
+    // times the cache build, including the shuffle, after creating its session.
+    runBenchmark("Cache a shuffled query") {
+      val benchmark = new Benchmark("Cache 5M rows after a shuffle", numRows, output = output)
+
+      def addShuffledCase(name: String, serializer: String)(
+          configure: SparkSession => Unit): Unit = {
+        benchmark.addTimerCase(name) { timer =>
+          val spark = createFreshSession(serializer)
+          try {
+            configure(spark)
+            val df = spark.range(numRows).repartition(1).selectExpr(
+              "id as int_col",
+              "id * 2L as long_col",
+              "cast(id as double) as double_col"
+            )
+            timer.startTiming()
+            df.cache()
+            df.count() // Materialize cache
+            timer.stopTiming()
+            df.unpersist(blocking = true)
+          } finally {
+            spark.stop()
+          }
+        }
+      }
+
+      val arrow = classOf[ArrowCachedBatchSerializer].getName
+      addShuffledCase("Default cache - shuffled input",
+        "org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer")(_ => ())
+      addShuffledCase("Arrow cache - shuffled input", arrow)(_ => ())
+      // Without AQE the same query reaches the Arrow serializer as rows, without RowToColumnarExec.
+      addShuffledCase("Arrow cache - shuffled input (AQE off)", arrow) { spark =>
+        spark.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
+      }
+      benchmark.run()
+    }
+  }
+
   private def recacheArrowData(): Unit = {
     val numRows = 2000000 // 2M rows
     runBenchmark("Re-cache Arrow cached data (zero-copy test)") {
@@ -793,13 +837,70 @@ object ArrowCacheBenchmark extends SqlBasedBenchmark {
     }
   }
 
+  private def columnPruningWideTable(): Unit = {
+    // 1M rows x 50 long columns is a ~400MB uncompressed cache -- wide enough that pruning 49 of
+    // 50 columns matters, but small enough to sit comfortably in the benchmark heap so the timing
+    // reflects the read, not GC pressure from a cache that nearly fills the heap.
+    val numRows = 1000000
+    val numCols = 50
+    val cols = (0 until numCols).map(i => s"id + $i as col$i")
+
+    // Measure only the read: summing one column while pruning the other 49. Each case builds and
+    // fully materializes its cache before starting the timer (via addTimerCase), so the numbers
+    // reflect the cached-scan read path -- which column pruning speeds up -- not the one-time cache
+    // materialization. An aggregate is used rather than a projection to a noop sink because the
+    // latter does not pull the selected column's data through the read path. The cache serializer
+    // is a JVM-wide static, so each case creates its own fresh session (excluded from timing),
+    // which also lets the Default and Arrow serializers share one comparison table.
+    val default = "org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer"
+    val arrow = "org.apache.spark.sql.execution.columnar.ArrowCachedBatchSerializer"
+    runBenchmark(s"Cache with column pruning (sum 1 of $numCols columns)") {
+      val benchmark = new Benchmark(
+        s"Sum 1 of $numCols columns, $numRows rows", numRows, output = output)
+
+      def addPruningCase(name: String, serializer: String)(
+          configure: SparkSession => Unit): Unit = {
+        benchmark.addTimerCase(name) { timer =>
+          val spark = createFreshSession(serializer)
+          try {
+            configure(spark)
+            val df = spark.range(numRows).selectExpr(cols: _*)
+            df.cache()
+            df.count() // materialize the cache before timing
+            timer.startTiming()
+            df.selectExpr("sum(col0)").collect()
+            timer.stopTiming()
+            df.unpersist(blocking = true)
+          } finally {
+            spark.stop()
+          }
+        }
+      }
+
+      addPruningCase("Default cache", default)(_ => ())
+      addPruningCase("Default cache (uncompressed)", default) { spark =>
+        spark.conf.set("spark.sql.inMemoryColumnarStorage.compressed", "false")
+      }
+      addPruningCase("Arrow cache", arrow)(_ => ())
+      Seq("-1", "1", "3").foreach { level =>
+        addPruningCase(s"Arrow cache (zstd level $level)", arrow) { spark =>
+          spark.conf.set(SQLConf.ARROW_EXECUTION_COMPRESSION_CODEC.key, "zstd")
+          spark.conf.set(SQLConf.ARROW_EXECUTION_ZSTD_COMPRESSION_LEVEL.key, level)
+        }
+      }
+      benchmark.run()
+    }
+  }
+
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
     runBenchmark("Arrow Cache vs Default Cache") {
       cachePrimitiveTypes()
       cacheWithFilters()
       cacheColumnarInput()
+      cacheShuffledQuery()
       recacheArrowData()
       columnPruning()
+      columnPruningWideTable()
     }
   }
 }

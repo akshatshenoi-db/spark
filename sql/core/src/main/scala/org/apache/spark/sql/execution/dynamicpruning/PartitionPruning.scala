@@ -23,11 +23,11 @@ import org.apache.spark.sql.catalyst.optimizer.{JoinSelectionHelper, ReusableBro
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.connector.read.SupportsRuntimeV2Filtering
 import org.apache.spark.sql.execution.LogicalRDD
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
-import org.apache.spark.sql.execution.datasources.v2.ExtractV2Scan
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
+
 /**
  * Dynamic partition pruning optimization is performed based on the type and
  * selectivity of the join operation. During query optimization, we insert a
@@ -78,10 +78,8 @@ object PartitionPruning extends Rule[LogicalPlan] with PredicateHelper with Join
         } else {
           None
         }
-      case (resExp, r @ ExtractV2Scan(scan: SupportsRuntimeV2Filtering)) =>
-        val filterAttrs = V2ExpressionUtils.resolveAttributeRefs(
-          scan.filterAttributes, r.output)
-        if (resExp.references.subsetOf(filterAttrs)) {
+      case (resExp, r: DataSourceV2ScanRelation) =>
+        if (resExp.references.subsetOf(r.runtimeFilterAttrs)) {
           Some(r)
         } else {
           None
@@ -115,7 +113,15 @@ object PartitionPruning extends Rule[LogicalPlan] with PredicateHelper with Join
     } else {
       None
     }
-    lazy val hasBenefit = pruningHasBenefit(
+    // A standalone DPP subquery reads the filtering side again, apart from the join. A V2 scan
+    // with a row-selecting pushdown, such as a limit, may then return other rows, and the DPP
+    // filter would prune partitions that the join needs. So such a side may only reuse the
+    // join's broadcast, which reads it once. A side with a UDF that needs extraction may only
+    // reuse it too, as the standalone subquery would fail on the UDF.
+    lazy val hasBenefit = !filteringPlan.exists {
+      case r: DataSourceV2ScanRelation => !r.onlyRowWisePushdowns
+      case _ => false
+    } && !needsUDFExtraction(filteringPlan, filteringKeys) && pruningHasBenefit(
       pruningKey, partScan, filteringKeys.head, filteringPlan, hasSelectivePredicate(filteringPlan))
     if (reuseEnabled || hasBenefit) {
       // insert a DynamicPruning wrapper to identify the subquery during query planning
@@ -131,6 +137,19 @@ object PartitionPruning extends Rule[LogicalPlan] with PredicateHelper with Join
       // abort dynamic partition pruning
       pruningPlan
     }
+  }
+
+  /**
+   * Returns whether the filtering plan or keys have a UDF that only the "Extract UDFs" batch,
+   * which runs after this rule, plans for evaluation: a scalar Python UDF, a Python UDTF or an
+   * external UDF. That batch does not rewrite the plan of a [[DynamicPruningSubquery]], so a
+   * standalone DPP subquery, which evaluates the keys over the plan, would fail on such a UDF.
+   */
+  private def needsUDFExtraction(plan: LogicalPlan, keys: Seq[Expression]): Boolean = {
+    (keys ++ plan.flatMap(_.expressions)).exists(_.exists {
+      case _: PythonUDTF | _: ExternalUserDefinedFunction => true
+      case e => PythonUDF.isScalarPythonUDF(e)
+    })
   }
 
   /**
@@ -235,6 +254,12 @@ object PartitionPruning extends Rule[LogicalPlan] with PredicateHelper with Join
 
   private def hasSelectivePredicate(plan: LogicalPlan): Boolean = plan.exists {
     case f: Filter => isLikelySelective(f.condition)
+    // A V2 scan may take a filter in fully and leave no `Filter` above it, as a built-in file
+    // scan does with a partition filter, where V1 keeps one. A scan with a row-selecting
+    // pushdown, such as a limit, is left out, since a DPP subquery may read it again and get
+    // other rows.
+    case r: DataSourceV2ScanRelation if r.onlyRowWisePushdowns =>
+      r.pushedFilters.exists(isLikelySelective)
     case _ => false
   }
 

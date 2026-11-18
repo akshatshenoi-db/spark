@@ -34,12 +34,13 @@ import org.apache.commons.compress.archivers.zip.ZipFile
 import org.apache.commons.io.ByteOrderMark
 import org.apache.commons.io.input.{BOMInputStream, CloseShieldInputStream}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FSDataInputStream, Path}
+import org.apache.hadoop.fs.{FileStatus, FSDataInputStream, GlobPattern, Path}
 import org.apache.hadoop.io.Text
 import org.apache.hadoop.util.LineReader
 
 import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.io.HadoopCodecStreams
 import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.errors.QueryExecutionErrors
@@ -105,16 +106,18 @@ trait SupportsArchiveFormat extends Logging {
    * Reads an archive by unpacking each entry to a temp file and applying `readEntry`, for a
    * format that needs a complete file on disk (random access).
    *
-   * @param file       the archive as a [[PartitionedFile]]
-   * @param conf       Hadoop configuration used to open the archive
-   * @param tempPrefix prefix for the per-task temp dir the entries are unpacked into
-   * @param readEntry  reads one unpacked entry file into rows
+   * @param file              the archive as a [[PartitionedFile]]
+   * @param conf              Hadoop configuration used to open the archive
+   * @param tempPrefix        prefix for the per-task temp dir the entries are unpacked into
+   * @param archivePathFilter optional glob matched against the entry's full path
+   * @param readEntry         reads one unpacked entry file into rows
    * @return iterator of rows across all entries
    */
   protected def readLocalizedEntries(
       file: PartitionedFile,
       conf: Configuration,
-      tempPrefix: String)(
+      tempPrefix: String,
+      archivePathFilter: Option[GlobPattern])(
       readEntry: PartitionedFile => Iterator[InternalRow]): Iterator[InternalRow] = {
     val tempDir = Utils.createTempDir(Utils.getLocalDir(SparkEnv.get.conf), tempPrefix)
     // Register cleanup before constructing `entries`, which can throw before returning an iterator
@@ -123,7 +126,8 @@ trait SupportsArchiveFormat extends Logging {
       Utils.deleteRecursively(tempDir)
     })
     val entries =
-      try SupportsArchiveFormat.localizeEntries(file.toPath, conf, tempDir, archiveEntryFilter)
+      try SupportsArchiveFormat.localizeEntries(
+        file.toPath, conf, tempDir, archiveEntryFilter, archivePathFilter)
       catch {
         case NonFatal(e) =>
           Utils.deleteRecursively(tempDir)
@@ -216,6 +220,33 @@ object SupportsArchiveFormat {
       lower.endsWith(".zip") || lower.endsWith(".7z")
   }
 
+  /**
+   * Fails when the `decompression` read option is set for the archive at `path`. The option is
+   * not supported for archives (yet): a container is always decoded based on its file name
+   * extension, so fail rather than silently ignore the option. Called while planning the scan so
+   * the error is raised on the driver and is not swallowed by `ignoreCorruptFiles`.
+   */
+  def checkNoDecompressionCodec(path: Path, decompressionCodec: Option[String]): Unit = {
+    if (decompressionCodec.isDefined) {
+      throw QueryExecutionErrors.decompressionCodecForArchiveUnsupportedError(path.toString)
+    }
+  }
+
+  /**
+   * [[checkNoDecompressionCodec]] for every archive among `inputPaths`. Called by the
+   * archive-aware schema inference paths on the driver, before their inference tasks open any
+   * archive, so inference fails with the same error as the scan instead of a task failure that
+   * `ignoreCorruptFiles` could swallow.
+   */
+  def checkNoDecompressionCodecForArchives(
+      inputPaths: Seq[FileStatus],
+      decompressionCodec: Option[String]): Unit = {
+    if (decompressionCodec.isDefined) {
+      inputPaths.iterator.map(_.getPath).find(isArchivePath)
+        .foreach(checkNoDecompressionCodec(_, decompressionCodec))
+    }
+  }
+
   /** An archive's entries as lazy `(entry, stream)` pairs; closing releases the container. */
   private type ArchiveEntries = Iterator[(ArchiveEntry, InputStream)] with Closeable
 
@@ -224,6 +255,8 @@ object SupportsArchiveFormat {
    * `(entry, stream)` pairs.
    */
   private def openArchiveStream(path: Path, conf: Configuration): ArchiveEntries = {
+    // Backstop for any path that opens an archive without one of the driver-side checks above.
+    checkNoDecompressionCodec(path, Option(conf.get(HadoopCodecStreams.DECOMPRESSION_CODEC_CONF)))
     val name = path.getName.toLowerCase(Locale.ROOT)
     name match {
       case n if n.endsWith(".tar") || n.endsWith(".tar.gz") || n.endsWith(".tgz") =>
@@ -396,10 +429,16 @@ object SupportsArchiveFormat {
    *
    * @param entry                   the archive entry to test
    * @param ignoredPathSegmentRegex per-segment filter matched against each `/`-separated component
-   * @return true if the entry is a directory or any path component is filtered out
+   * @param archivePathFilter       optional glob matched against the entry's full path
+   * @return true if the entry is a directory, any path component is filtered out, or the entry's
+   *         path does not match `archivePathFilter`
    */
-  private def shouldSkipEntry(entry: ArchiveEntry, ignoredPathSegmentRegex: Pattern): Boolean = {
+  private def shouldSkipEntry(
+      entry: ArchiveEntry,
+      ignoredPathSegmentRegex: Pattern,
+      archivePathFilter: Option[GlobPattern]): Boolean = {
     if (entry.isDirectory) return true
+    if (archivePathFilter.exists(!_.matches(entry.getName))) return true
     entry.getName.split("/").exists(c =>
       c.nonEmpty && HadoopFSUtils.shouldFilterOutPathName(c, ignoredPathSegmentRegex))
   }
@@ -413,13 +452,15 @@ object SupportsArchiveFormat {
    * @param ignoredPathSegmentRegex per-segment filter for entries to skip (defaults to the
    *                                `InMemoryFileIndex` filter); pass a custom one to match a
    *                                loose-file scan
+   * @param archivePathFilter       optional glob matched against the entry's full path
    * @param parseEntry              turns one entry's `(entry, stream)` into an iterator of results
    * @return the concatenated results across kept entries, lazily one entry at a time
    */
   def readArchiveEntries[T](
       path: Path,
       conf: Configuration,
-      ignoredPathSegmentRegex: Pattern = HadoopFSUtils.defaultIgnoredPathSegmentRegexPattern)(
+      ignoredPathSegmentRegex: Pattern = HadoopFSUtils.defaultIgnoredPathSegmentRegexPattern,
+      archivePathFilter: Option[GlobPattern])(
       parseEntry: (ArchiveEntry, InputStream) => Iterator[T]): Iterator[T] = {
     val maxDepth = SQLConf.get.getConf(SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH)
     streamEntries(
@@ -474,7 +515,9 @@ object SupportsArchiveFormat {
           var next: (ArchiveEntry, InputStream) = null
           while (next == null && archive.hasNext) {
             val entry = archive.next()
-            if (!shouldSkipEntry(entry._1, ignoredPathSegmentRegex)) next = entry
+            if (!shouldSkipEntry(entry._1, ignoredPathSegmentRegex, archivePathFilter)) {
+              next = entry
+            }
           }
           if (next == null) {
             done = true
@@ -558,17 +601,19 @@ object SupportsArchiveFormat {
    * companion so executor-side callers (a format's distributed archive inference) can use it
    * without a trait instance.
    *
-   * @param path        the archive path
-   * @param conf        Hadoop configuration used to open the archive
-   * @param localDir    directory the per-entry temp files are created under
-   * @param entryFilter which entry names to keep
+   * @param path              the archive path
+   * @param conf              Hadoop configuration used to open the archive
+   * @param localDir          directory the per-entry temp files are created under
+   * @param entryFilter       which entry names to keep
+   * @param archivePathFilter optional glob matched against the entry's full path
    */
   def localizeEntries(
       path: Path,
       conf: Configuration,
       localDir: File,
-      entryFilter: String => Boolean): Iterator[(String, File)] =
-    readArchiveEntries(path, conf) { (entry, in) =>
+      entryFilter: String => Boolean,
+      archivePathFilter: Option[GlobPattern]): Iterator[(String, File)] =
+    readArchiveEntries(path, conf, archivePathFilter = archivePathFilter) { (entry, in) =>
       val name = entry.getName
       if (entryFilter(name)) {
         Iterator.single((name, copyEntryToLocalFile(in, localDir, name)))

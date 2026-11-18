@@ -73,6 +73,7 @@ object RuleIdCollection {
       "org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveTempViews" ::
       "org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveTranspose" ::
       "org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveUnpivot" ::
+      "org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveUnresolvedInsert" ::
       "org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveUpCast" ::
       "org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveWindowFrame" ::
       "org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveWindowOrder" ::
@@ -89,6 +90,7 @@ object RuleIdCollection {
       "org.apache.spark.sql.catalyst.analysis.ResolveEventTimeWatermark" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveExecuteImmediate" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveExpressionsWithNamePlaceholders" ::
+      "org.apache.spark.sql.catalyst.analysis.ResolveExternalLookupHint" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveGroupByAll" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveHigherOrderFunctions" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveHints$ResolveCoalesceHints" ::
@@ -101,6 +103,7 @@ object RuleIdCollection {
       "org.apache.spark.sql.catalyst.analysis.ResolveCursors" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveFetchCursor" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveBinBy" ::
+      "org.apache.spark.sql.catalyst.analysis.ResolveGapFill" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveAsOfJoin" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveSetVariable" ::
       "org.apache.spark.sql.catalyst.analysis.ResolveTableConstraints" ::
@@ -127,6 +130,7 @@ object RuleIdCollection {
       "org.apache.spark.sql.catalyst.optimizer.CollapseRepartition" ::
       "org.apache.spark.sql.catalyst.optimizer.CollapseWindow" ::
       "org.apache.spark.sql.catalyst.optimizer.ColumnPruning" ::
+      "org.apache.spark.sql.catalyst.optimizer.CombineApproximatePercentiles" ::
       "org.apache.spark.sql.catalyst.optimizer.CombineConcats" ::
       "org.apache.spark.sql.catalyst.optimizer.CombineFilters" ::
       "org.apache.spark.sql.catalyst.optimizer.CombineTypedFilters" ::

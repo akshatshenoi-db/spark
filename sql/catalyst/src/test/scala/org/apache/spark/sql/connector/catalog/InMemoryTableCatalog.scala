@@ -32,6 +32,7 @@ import org.apache.spark.sql.connector.catalog.procedures.{BoundProcedure, Proced
 import org.apache.spark.sql.connector.distributions.{Distribution, Distributions}
 import org.apache.spark.sql.connector.expressions.{SortOrder, Transform}
 import org.apache.spark.sql.connector.read.{LocalScan, Scan}
+import org.apache.spark.sql.internal.connector.SchemaAlignmentConfig
 import org.apache.spark.sql.types.{DataTypes, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -48,11 +49,12 @@ class BasicInMemoryTableCatalog extends TableCatalog {
 
   private var _name: Option[String] = None
   private var copyOnLoad: Boolean = false
+  private var stateOptionKeys: util.Set[String] = util.Set.of()
 
-  // Records every (TableContext, options) pair passed to the options-aware loadTable(), in call
-  // order, so tests can verify that the analyzer / DataFrame API correctly constructed and
-  // forwarded them -- including how many times loadTable was called when the same table is
-  // referenced more than once in a statement with different options.
+  // Records every (TableContext, table-state options) pair passed to the options-aware
+  // loadTable(), in call order, so tests can verify that the analyzer / DataFrame API correctly
+  // constructed and forwarded them -- including how many times loadTable was called when the same
+  // table is referenced more than once in a statement with different options.
   // "loadTable" is in the name because the subclass InMemoryChangelogCatalog has an analogous
   // `lastOptions` recording the options passed to loadChangelog(); the two must not collide.
   private val _loadTableCalls = mutable.ArrayBuffer.empty[(TableContext, CaseInsensitiveStringMap)]
@@ -65,7 +67,12 @@ class BasicInMemoryTableCatalog extends TableCatalog {
   override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {
     _name = Some(name)
     copyOnLoad = options.getBoolean("copyOnLoad", false)
+    stateOptionKeys = Option(options.get("tableStateOptionKeys"))
+      .map(_.split(",").iterator.map(_.trim).filter(_.nonEmpty).toSet.asJava)
+      .getOrElse(util.Set.of())
   }
+
+  override def tableStateOptionKeys(): util.Set[String] = stateOptionKeys
 
   override def name: String = _name.get
 
@@ -138,14 +145,14 @@ class BasicInMemoryTableCatalog extends TableCatalog {
     }
   }
 
-  // Records the forwarded context/options so tests can verify they reached the catalog, then
+  // Records the forwarded context/state options so tests can verify they reached the catalog, then
   // defers to the default dispatch in TableCatalog (rather than reimplementing it here).
   override def loadTable(
       ident: Identifier,
       context: TableContext,
-      options: CaseInsensitiveStringMap): Table = {
-    _loadTableCalls += ((context, options))
-    super.loadTable(ident, context, options)
+      stateOptions: CaseInsensitiveStringMap): Table = {
+    _loadTableCalls += ((context, stateOptions))
+    super.loadTable(ident, context, stateOptions)
   }
 
   override def invalidateTable(ident: Identifier): Unit = {
@@ -187,12 +194,39 @@ class BasicInMemoryTableCatalog extends TableCatalog {
     InMemoryTableCatalog.maybeSimulateFailedTableCreation(properties)
 
     val tableName = s"$name.${ident.quoted}"
-    val table = new InMemoryTable(tableName, columns, partitions, properties, constraints,
-      distribution, ordering, requiredNumPartitions, advisoryPartitionSize,
-      distributionStrictlyRequired, numRowsPerSplit)
+    val table = newInMemoryTable(
+      tableName, columns, partitions, properties, constraints, distribution, ordering,
+      requiredNumPartitions, advisoryPartitionSize, distributionStrictlyRequired, numRowsPerSplit,
+      util.UUID.randomUUID().toString)
     tables.put(ident, table)
     namespaces.putIfAbsent(ident.namespace.toList, Map())
     table
+  }
+
+  /**
+   * Builds the in-memory table this catalog serves. Subclasses that expose a specialized table
+   * type must override this so both CREATE and ALTER reconstruct the same class.
+   */
+  // scalastyle:off argcount
+  protected def newInMemoryTable(
+      name: String,
+      columns: Array[Column],
+      partitioning: Array[Transform],
+      properties: util.Map[String, String],
+      constraints: Array[Constraint],
+      distribution: Distribution,
+      ordering: Array[SortOrder],
+      requiredNumPartitions: Option[Int],
+      advisoryPartitionSize: Option[Long],
+      distributionStrictlyRequired: Boolean,
+      numRowsPerSplit: Int,
+      id: String,
+      schemaAlignmentConfig: SchemaAlignmentConfig = SchemaAlignmentConfig.DEFAULT
+  ): InMemoryBaseTable = {
+    // scalastyle:on argcount
+    new InMemoryTable(name, columns, partitioning, properties, constraints, distribution,
+      ordering, requiredNumPartitions, advisoryPartitionSize, distributionStrictlyRequired,
+      numRowsPerSplit, id, schemaAlignmentConfig)
   }
 
   override def alterTable(ident: Identifier, changes: TableChange*): Table = {
@@ -229,31 +263,21 @@ class BasicInMemoryTableCatalog extends TableCatalog {
     }
 
     table.increaseVersion()
-    val currentVersion = table.version()
     val columnsWithIds = InMemoryBaseTable.assignMissingIds(
-      CatalogV2Util.structTypeToV2Columns(schema))
+      InMemoryTableCatalog.alteredColumns(table.columns(), schema, changes))
+    val reconstructedId = Option(table.id()).getOrElse(util.UUID.randomUUID().toString)
     val newTable = table match {
-      case _: InMemoryTable =>
-        new InMemoryTable(
-          name = table.name,
-          columns = columnsWithIds,
-          partitioning = finalPartitioning,
-          properties = properties,
-          constraints = constraints,
-          id = table.id)
-          .alterTableWithData(table.data, schemaAfterDrops)
-      case _: InMemoryTableWithV2Filter =>
-        new InMemoryTableWithV2Filter(
-          name = table.name,
-          columns = columnsWithIds,
-          partitioning = finalPartitioning,
-          properties = properties)
+      case _: InMemoryTable | _: InMemoryTableWithV2Filter =>
+        newInMemoryTable(
+          table.name, columnsWithIds, finalPartitioning, properties, constraints,
+          table.distribution, table.ordering, table.numPartitions, table.advisoryPartitionSize,
+          table.isDistributionStrictlyRequired, table.numRowsPerSplit, reconstructedId)
           .alterTableWithData(table.data, schemaAfterDrops)
       case other =>
         throw new UnsupportedOperationException(
           s"Unsupported InMemoryBaseTable subclass: ${other.getClass.getName}")
     }
-    newTable.setVersion(currentVersion)
+    newTable.copyTableStateFrom(table)
     changes.foreach {
       case a: TableChange.AddConstraint =>
         newTable.setValidatedVersion(a.validatedTableVersion())
@@ -454,6 +478,26 @@ object InMemoryTableCatalog {
   def maybeSimulateFailedTableCreation(tableProperties: util.Map[String, String]): Unit = {
     if ("true".equalsIgnoreCase(tableProperties.get(SIMULATE_FAILED_CREATE_PROPERTY))) {
       throw new IllegalStateException("Manual create table failure.")
+    }
+  }
+
+  /**
+   * Returns the columns of `schema`, the schema that `changes` make of a table with `columns`.
+   * The columns that no change refers to are kept as they are, since converting a column to a
+   * StructField and back loses what a StructField does not hold, such as a connector expression
+   * or an identity column spec.
+   */
+  def alteredColumns(
+      columns: Array[Column],
+      schema: StructType,
+      changes: Seq[TableChange]): Array[Column] = {
+    val changedNames = changes.collect {
+      case change: TableChange.ColumnChange => change.fieldNames().head
+    }.toSet
+    val unchangedColumns = columns.filterNot(col => changedNames.contains(col.name))
+      .map(col => col.name -> col).toMap
+    CatalogV2Util.structTypeToV2Columns(schema).map { col =>
+      unchangedColumns.getOrElse(col.name, col)
     }
   }
 }

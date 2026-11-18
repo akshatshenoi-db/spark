@@ -22,18 +22,22 @@ import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 
 import scala.concurrent.duration.Duration
+import scala.jdk.CollectionConverters._
 
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
 
 import org.apache.spark.{SparkException, SparkIllegalArgumentException, SparkIllegalStateException, TaskContext}
 import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart, SparkListenerStageCompleted, SparkListenerStageSubmitted}
+import org.apache.spark.sql.execution.UnionExec
 import org.apache.spark.sql.execution.datasources.v2.RealTimeStreamScanExec
 import org.apache.spark.sql.execution.exchange.{ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.streaming.RealTimeTrigger
+import org.apache.spark.sql.execution.streaming.operators.stateful.StreamingDeduplicateWithinWatermarkExec
 import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamExecution}
 import org.apache.spark.sql.execution.streaming.sources.{ContinuousMemorySink, LowLatencyMemoryStream}
-import org.apache.spark.sql.execution.streaming.state.{FailureInjectionCheckpointFileManager, FailureInjectionFileSystem}
-import org.apache.spark.sql.functions.{broadcast, concat, lit, udf}
+import org.apache.spark.sql.execution.streaming.state.{FailureInjectionCheckpointFileManager,
+  FailureInjectionFileSystem, RocksDBStateStoreProvider}
+import org.apache.spark.sql.functions.{broadcast, concat, lit, timestamp_seconds, udf}
 import org.apache.spark.sql.internal.SQLConf
 
 class StreamRealTimeModeSuite extends StreamRealTimeModeSuiteBase {
@@ -257,6 +261,29 @@ class StreamRealTimeModeSuite extends StreamRealTimeModeSuiteBase {
     }
   }
 
+  test("pipelined shuffle: a union reads a shuffle that is not its first child") {
+    // The union stage runs the single-partition stream as task 0 and the repartitioned stream's
+    // reduce partitions 0 and 1 as tasks 1 and 2, so its shuffle readers must connect to the
+    // writers as their reduce partitions rather than their task partitions.
+    val inputData1 = LowLatencyMemoryStream.singlePartition[Int]
+    val inputData2 = LowLatencyMemoryStream[Int](2)
+    val unioned = inputData1.toDS().union(inputData2.toDS().repartition(2))
+
+    testStream(unioned, OutputMode.Update, Map.empty, new ContinuousMemorySink())(
+      AddData(inputData1, (0 until 10): _*),
+      AddData(inputData2, (10 until 100): _*),
+      StartStream(),
+      CheckAnswerWithTimeout(60000, (0 until 100): _*),
+      Execute { q =>
+        val union = q.lastExecution.executedPlan.collectFirst { case u: UnionExec => u }.get
+        val shuffles = union.children.map(_.collect { case s: ShuffleExchangeExec => s })
+        assert(shuffles.map(_.nonEmpty) == Seq(false, true))
+        assert(shuffles(1).forall(_.pipelined), "the streaming-path shuffle must be pipelined")
+      },
+      StopStream
+    )
+  }
+
   test("multiple broadcast joins with the same static table run in Real-Time Mode") {
     // Two broadcast joins against the SAME static table -- exchange reuse collapses the second
     // broadcast into a ReusedExchangeExec. This is the supported reuse shape in Real-Time Mode: a
@@ -467,6 +494,57 @@ class StreamRealTimeModeWithManualClockSuite extends StreamRealTimeModeManualClo
     )
   }
 
+  test("transformWithState writes batch 0 metadata only after the RTM offset WAL") {
+    withSQLConf(
+      SQLConf.STREAMING_CHECKPOINT_FILE_MANAGER_CLASS.parent.key ->
+        classOf[FailureInjectionCheckpointFileManager].getName,
+      SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
+      SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+      withTempDir { checkpointDir =>
+        val injectionState = FailureInjectionFileSystem.registerTempPath(checkpointDir.getPath)
+        try {
+          val inputData = LowLatencyMemoryStream[String](1)
+          val result = inputData.toDS()
+            .groupByKey(value => value)
+            .transformWithState(
+              new RunningCountStatefulProcessor,
+              TimeMode.ProcessingTime(),
+              OutputMode.Update())
+          val metadataFile = new java.io.File(
+            checkpointDir, "state/0/_metadata/v2/0")
+          val stateSchemaDir = new java.io.File(
+            checkpointDir, "state/0/_stateSchema/default")
+
+          injectionState.failureCreateAtomicRegex = Seq(".*/offsets/0")
+          testStream(result, OutputMode.Update, Map.empty, new ContinuousMemorySink())(
+            AddData(inputData, "a"),
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+            CheckAnswerWithTimeout(60000, ("a", "1")),
+            Execute { _ =>
+              assert(Option(stateSchemaDir.listFiles()).exists(_.nonEmpty))
+              assert(!metadataFile.exists())
+            },
+            advanceRealTimeClock,
+            ExpectFailure[IOException]()
+          )
+          assert(!metadataFile.exists())
+
+          injectionState.failureCreateAtomicRegex = Seq.empty
+          testStream(result, OutputMode.Update, Map.empty, new ContinuousMemorySink())(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+            CheckAnswerWithTimeout(60000, ("a", "1")),
+            advanceRealTimeClock,
+            WaitUntilBatchProcessed(0),
+            StopStream
+          )
+          assert(metadataFile.exists())
+        } finally {
+          FailureInjectionFileSystem.removePathFromTempToInjectionState(checkpointDir.getPath)
+        }
+      }
+    }
+  }
+
   // ========================================================================================
   // Pipelined (streaming) shuffle: a stateful/repartition Real-Time Mode query whose shuffle is a
   // PipelinedShuffleDependency, so the producer (source scan) and consumer stages are co-scheduled
@@ -545,6 +623,109 @@ class StreamRealTimeModeWithManualClockSuite extends StreamRealTimeModeManualClo
       )
     } finally {
       spark.sparkContext.removeSparkListener(listener)
+    }
+  }
+
+  test("pipelined shuffle: dedup within watermark supports batch-end-only cleanup") {
+    val inputData = LowLatencyMemoryStream.singlePartition[(String, Int)]
+    val result = inputData.toDF()
+      .withColumn("eventTime", timestamp_seconds($"_2"))
+      .withWatermark("eventTime", "10 seconds")
+      .dropDuplicatesWithinWatermark("_1")
+      .select($"_1")
+
+    testStream(result, OutputMode.Update, Map.empty, new ContinuousMemorySink())(
+      // The second "dup" is suppressed in the live first batch. The high event time advances the
+      // watermark to 20 seconds after that batch completes.
+      AddData(inputData,
+        ("expired", 1), ("dup", 15), ("dup", 16), ("high", 30)),
+      StartStream(additionalConfs = Map(
+        SQLConf.STREAMING_STATE_INCREMENTAL_CLEANUP_FACTOR.key -> "0")),
+      CheckAnswerWithTimeout(60000, "expired", "dup", "high"),
+      Execute { q =>
+        val plan = q.lastExecution.executedPlan
+        assert(plan.exists(_.isInstanceOf[StreamingDeduplicateWithinWatermarkExec]),
+          s"expected StreamingDeduplicateWithinWatermarkExec, got:\n$plan")
+        assertAllExchangesPipelined(q)
+      },
+      advanceRealTimeClock,
+      WaitUntilBatchProcessed(0),
+
+      // "dup" remains in state across the batch boundary. At the end of this batch, "expired" is
+      // evicted because its expiry (11 seconds) is behind the 20-second eviction watermark
+      // inherited from batch 0.
+      AddData(inputData, ("dup", 26), ("middle", 32)),
+      CheckAnswerWithTimeout(60000, "expired", "dup", "high", "middle"),
+      advanceRealTimeClock,
+      WaitUntilBatchProcessed(1),
+
+      // Once its old state has been evicted, a new non-late "expired" record is emitted again.
+      // Late-event filtering deliberately trails eviction by one batch, so the event at 5 seconds
+      // is tested here, when the late-events watermark has advanced to 20 seconds.
+      AddData(inputData, ("expired", 31), ("dup", 27), ("late", 5), ("new", 35)),
+      CheckAnswerWithTimeout(
+        60000, "expired", "dup", "high", "middle", "expired", "new"),
+      advanceRealTimeClock,
+      WaitUntilBatchProcessed(2),
+      CheckAnswerWithTimeout(
+        60000, "expired", "dup", "high", "middle", "expired", "new"),
+      StopStream
+    )
+  }
+
+  test("pipelined shuffle: dedup within watermark supports incremental cleanup") {
+    withSQLConf(
+      SQLConf.STREAMING_STATE_INCREMENTAL_CLEANUP_FACTOR.key -> "1",
+      SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
+      SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+      val inputData = LowLatencyMemoryStream.singlePartition[(String, Int)]
+      val result = inputData.toDF()
+        .withColumn("eventTime", timestamp_seconds($"_2"))
+        .withWatermark("eventTime", "10 seconds")
+        .dropDuplicatesWithinWatermark("_1")
+        .select($"_1")
+
+      testStream(result, OutputMode.Update, Map.empty, new ContinuousMemorySink())(
+        AddData(inputData,
+          ("expired", 1), ("expired2", 2), ("expired3", 3), ("a", 15), ("clock", 30)),
+        StartStream(),
+        CheckAnswerWithTimeout(60000, "expired", "expired2", "expired3", "a", "clock"),
+        advanceRealTimeClock,
+        WaitUntilBatchProcessed(0),
+
+        AddData(inputData, ("advance", 40)),
+        CheckAnswerWithTimeout(60000, "expired", "expired2", "expired3", "a", "clock", "advance"),
+        advanceRealTimeClock,
+        WaitUntilBatchProcessed(1),
+        Execute { q =>
+          // Cleanup uses the late-events watermark (0), not the eviction watermark (20).
+          val operator = q.lastProgress.stateOperators.head
+          assert(operator.numRowsTotal === 6)
+          assert(operator.numRowsRemoved === 0)
+        },
+
+        // At the 20-second late-events watermark, three entries expire but "a" (expiry 25)
+        // must stay: its non-late duplicate at 24 is within 10 seconds of its first event.
+        // Two surviving inputs remove two entries incrementally; completion must remove the last.
+        // The emitted "probe" comes last so seeing it confirms the whole input was consumed.
+        AddData(inputData, ("a", 24), ("a", 20), ("probe", 40)),
+        CheckAnswerWithTimeout(
+          60000, "expired", "expired2", "expired3", "a", "clock", "advance", "probe"),
+        advanceRealTimeClock,
+        WaitUntilBatchProcessed(2),
+        CheckAnswerWithTimeout(
+          60000, "expired", "expired2", "expired3", "a", "clock", "advance", "probe"),
+        Execute { q =>
+          assertAllExchangesPipelined(q)
+          val operator = q.lastProgress.stateOperators.head
+          assert(operator.numRowsTotal === 4)
+          assert(operator.numRowsUpdated === 1)
+          assert(operator.numRowsDroppedByWatermark === 1)
+          assert(operator.numRowsRemoved === 3)
+          assert(operator.customMetrics.get("numRowsIncrementallyRemoved").longValue() === 2)
+        },
+        StopStream
+      )
     }
   }
 
@@ -695,10 +876,11 @@ class StreamRealTimeModeWithManualClockSuite extends StreamRealTimeModeManualClo
     }
   }
 
-  test("pipelined shuffle: an explicit sortBeforeRepartition=true does not stall the query") {
+  test("pipelined shuffle: an explicit sortBeforeRepartition=true is rejected") {
     // The deterministic local sort before a round-robin repartition never drains an unbounded
-    // stream, so Real-Time Mode overrides this config even when it is set explicitly -- honouring
-    // it would hang the query forever. See MicroBatchExecution.
+    // stream, so honouring sortBeforeRepartition=true would hang a Real-Time Mode query forever.
+    // Rather than silently override it, the pre-flight in StreamingQueryManager rejects the
+    // explicit value up front. See StreamingQueryManager.throwIfConfsAreRealTimeModeIncompatible.
     withSQLConf(
       SQLConf.SHUFFLE_PARTITIONS.key -> "2",
       SQLConf.SORT_BEFORE_REPARTITION.key -> "true") {
@@ -707,12 +889,14 @@ class StreamRealTimeModeWithManualClockSuite extends StreamRealTimeModeManualClo
         .repartition(4)
         .dropDuplicates("key")
         .select($"key")
-      testStream(result, OutputMode.Update, Map.empty, new ContinuousMemorySink())(
-        AddData(inputData, ("a", 1), ("b", 1), ("c", 1), ("a", 2)),
-        StartStream(),
-        CheckAnswerWithTimeout(60000, "a", "b", "c"),
-        StopStream
-      )
+      val e = intercept[SparkIllegalArgumentException] {
+        testStream(result, OutputMode.Update, Map.empty, new ContinuousMemorySink())(
+          AddData(inputData, ("a", 1), ("b", 1), ("c", 1), ("a", 2)),
+          StartStream()
+        )
+      }
+      checkError(e, condition = "STREAMING_REAL_TIME_MODE.SQL_CONFIGURATION_NOT_SUPPORTED",
+        parameters = e.getMessageParameters.asScala.toMap)
     }
   }
 

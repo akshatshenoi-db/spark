@@ -36,7 +36,7 @@ import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.DescribeCommandSchema
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
-import org.apache.spark.sql.catalyst.util.{escapeSingleQuotedString, quoteIfNeeded, CaseInsensitiveMap, CharVarcharUtils, DateTimeUtils, ResolveDefaultColumns}
+import org.apache.spark.sql.catalyst.util.{escapeSingleQuotedString, quoteIfNeeded, CaseInsensitiveMap, CharVarcharUtils, DateTimeUtils, ResolveDefaultColumns, TypeUtils}
 import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.CURRENT_DEFAULT_COLUMN_METADATA_KEY
 import org.apache.spark.sql.classic.ClassicConversions.castToImpl
 import org.apache.spark.sql.connector.catalog.{TableCatalog, V1Table, V1View}
@@ -94,6 +94,8 @@ case class CreateTableLikeCommand(
   override def run(sparkSession: SparkSession): Seq[Row] = {
     val catalog = sparkSession.sessionState.catalog
     val sourceTableDesc = catalog.getTempViewOrPermanentTableMetadata(sourceTable)
+    // A view can hold a FILE without a qualifier, which a table cannot store.
+    TypeUtils.checkNoUnknownFileTypeWrite(sourceTableDesc.schema)
     val newProvider = if (provider.isDefined) {
       if (!DDLUtils.isHiveTable(provider)) {
         // check the validation of provider input, invalid provider will throw
@@ -654,15 +656,16 @@ case class DescribeTableCommand(
       }
       describeSchema(metadata.schema, result, header = false)
     } else {
-      if (metadata.schema.isEmpty) {
+      val schema = if (metadata.schema.isEmpty) {
         // In older version(prior to 2.1) of Spark, the table schema can be empty and should be
         // inferred at runtime. We should still support it.
-        describeSchema(sparkSession.table(metadata.identifier).schema, result, header = false)
+        sparkSession.table(metadata.identifier).schema
       } else {
-        describeSchema(metadata.schema, result, header = false)
+        metadata.schema
       }
+      describeSchema(schema, result, header = false)
 
-      describePartitionInfo(metadata, result)
+      describePartitionInfo(metadata, schema, result)
       describeClusteringInfo(metadata, result)
 
       if (partitionSpec.nonEmpty) {
@@ -682,10 +685,29 @@ case class DescribeTableCommand(
     result.toSeq
   }
 
-  private def describePartitionInfo(table: CatalogTable, buffer: ArrayBuffer[Row]): Unit = {
-    if (table.partitionColumnNames.nonEmpty) {
-      append(buffer, "# Partition Information", "", "")
-      describeSchema(table.partitionSchema, buffer, header = true)
+  private def describePartitionInfo(
+      table: CatalogTable,
+      schema: StructType,
+      buffer: ArrayBuffer[Row]): Unit = {
+    val partitionColumnNames = table.partitionColumnNames
+    if (partitionColumnNames.nonEmpty) {
+      // Same positional convention as `CatalogTable.partitionSchema`, but reported instead of
+      // asserted so that a table with inconsistent metadata stays describable.
+      val partitionFields = schema.takeRight(partitionColumnNames.length)
+      val consistent = partitionFields.length == partitionColumnNames.length &&
+        partitionFields.map(_.name).zip(partitionColumnNames).forall {
+          case (schemaColumn, partitionColumn) => conf.resolver(schemaColumn, partitionColumn)
+        }
+      if (consistent) {
+        append(buffer, "# Partition Information", "", "")
+        describeSchema(StructType(partitionFields), buffer, header = true)
+      } else {
+        append(buffer, "# Invalid Partition Information", "", "")
+        append(buffer, "Declared Partition Columns",
+          partitionColumnNames.mkString("[", ", ", "]"), "")
+        append(buffer, "Last Columns in Table Schema",
+          partitionFields.map(_.name).mkString("[", ", ", "]"), "")
+      }
     }
   }
 

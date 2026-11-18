@@ -19,10 +19,10 @@ package org.apache.spark.sql.internal
 import org.apache.spark.annotation.Unstable
 import org.apache.spark.sql.{DataSourceRegistration, ExperimentalMethods, SparkSessionExtensions, UDTFRegistration}
 import org.apache.spark.sql.artifact.ArtifactManager
-import org.apache.spark.sql.catalyst.analysis.{Analyzer, EvalSubqueriesForTimeTravel, FunctionRegistry, InvokeProcedures, ReplaceCharWithVarchar, ResolveDataSource, ResolveEventTimeWatermark, ResolveExecuteImmediate, ResolveMetricView, ResolveSessionCatalog, ResolveSetCatalogCommand, ResolveTranspose, TableFunctionRegistry}
+import org.apache.spark.sql.catalyst.analysis.{Analyzer, CheckExternalLookupJoin, EvalSubqueriesForTimeTravel, FunctionRegistry, InvokeProcedures, ReplaceCharWithVarchar, ResolveDataSource, ResolveEventTimeWatermark, ResolveExecuteImmediate, ResolveMetricView, ResolveSessionCatalog, ResolveSetCatalogCommand, ResolveTranspose, TableFunctionRegistry}
 import org.apache.spark.sql.catalyst.analysis.resolver.ResolverExtension
 import org.apache.spark.sql.catalyst.catalog.{FunctionExpressionBuilder, SessionCatalog}
-import org.apache.spark.sql.catalyst.expressions.{Expression, ExtractSemiStructuredFields}
+import org.apache.spark.sql.catalyst.expressions.{Expression, ExtractSemiStructuredFields, ParseSql}
 import org.apache.spark.sql.catalyst.normalizer.NormalizeCTEIds
 import org.apache.spark.sql.catalyst.optimizer.Optimizer
 import org.apache.spark.sql.catalyst.parser.ParserInterface
@@ -38,8 +38,6 @@ import org.apache.spark.sql.execution.analysis.DetectAmbiguousSelfJoin
 import org.apache.spark.sql.execution.command.{CheckViewReferences, CommandCheck}
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.v2.{TableCapabilityCheck, V2SessionCatalog}
-import org.apache.spark.sql.execution.externalUDF.{ClassicExternalUDFPlanner,
-  ExternalUDFPlanner, UnifiedExternalUDFPlanner}
 import org.apache.spark.sql.execution.streaming.runtime.ResolveWriteToStream
 import org.apache.spark.sql.expressions.UserDefinedAggregateFunction
 import org.apache.spark.sql.util.ExecutionListenerManager
@@ -96,7 +94,12 @@ abstract class BaseSessionStateBuilder(
    */
   protected lazy val functionRegistry: FunctionRegistry = {
     parentState.map(_.functionRegistry.clone())
-      .getOrElse(extensions.registerFunctions(FunctionRegistry.builtin.clone()))
+      .getOrElse {
+        val registry = FunctionRegistry.builtin.clone()
+        // sql/core-only builtins that need SparkSqlParser.
+        ParseSql.register(registry)
+        extensions.registerFunctions(registry)
+      }
   }
 
   /**
@@ -260,6 +263,7 @@ abstract class BaseSessionStateBuilder(
         PreReadCheck +:
         HiveOnlyCheck +:
         TableCapabilityCheck +:
+        CheckExternalLookupJoin +:
         CommandCheck +:
         CheckViewReferences +:
         ViewSyncSchemaToMetaStore +:
@@ -410,19 +414,6 @@ abstract class BaseSessionStateBuilder(
       extensions.buildQueryPostPlannerStrategyRules(session))
   }
 
-  /**
-   * Strategy for converting (Python) UDF calls into logical plan
-   * nodes. Uses the unified external UDF worker framework when
-   * the config is enabled, otherwise the classic Python runner.
-   */
-  protected def externalUDFPlanner: ExternalUDFPlanner = {
-    if (conf.getConf(SQLConf.UNIFIED_UDF_EXECUTION_ENABLED)) {
-      new UnifiedExternalUDFPlanner(session.sparkContext.conf)
-    } else {
-      new ClassicExternalUDFPlanner()
-    }
-  }
-
   protected def planNormalizationRules: Seq[Rule[LogicalPlan]] = {
     NormalizeCTEIds +:
     extensions.buildPlanNormalizationRules(session)
@@ -504,8 +495,7 @@ abstract class BaseSessionStateBuilder(
       columnarRules,
       adaptiveRulesHolder,
       planNormalizationRules,
-      () => artifactManager,
-      externalUDFPlanner)
+      () => artifactManager)
   }
 }
 

@@ -17,6 +17,10 @@
 
 package org.apache.spark.sql.catalyst.expressions;
 
+import com.google.common.hash.HashFunction;
+import com.google.common.hash.Hashing;
+import com.ibm.icu.text.Normalizer2;
+
 import java.nio.ByteBuffer;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
@@ -52,6 +56,7 @@ public class ExpressionImplUtils {
   private static final int GCM_IV_LEN = 12;
   private static final int GCM_TAG_LEN = 128;
   private static final int CBC_IV_LEN = 16;
+  private static final HashFunction FARM_FINGERPRINT_64 = Hashing.farmHashFingerprint64();
 
   enum CipherMode {
     ECB("ECB", 0, 0, "AES/ECB/PKCS5Padding", false, false),
@@ -147,6 +152,28 @@ public class ExpressionImplUtils {
   public static UTF8String tryValidateUTF8String(UTF8String utf8String) {
     if (utf8String.isValid()) return utf8String;
     else return null;
+  }
+
+  /**
+   * Normalizes the given string using the given Unicode normalization form, per the
+   * decomposition/composition algorithm in Unicode Standard Annex #15. Uses ICU4J, the same
+   * library backing Spark's collation support, instead of the JDK's {@code java.text.Normalizer}
+   * so the result is pinned to Spark's bundled ICU4J/Unicode data (see {@code icu4j.version} in
+   * pom.xml) and does not vary across JVM vendors or versions.
+   *
+   * @param input the input string to normalize.
+   * @param form the normalization form, one of NFC, NFD, NFKC, NFKD (case-insensitive).
+   * @return the normalized string.
+   */
+  public static UTF8String normalize(UTF8String input, UTF8String form) {
+    Normalizer2 normalizer = switch (form.toString().toUpperCase(Locale.ROOT)) {
+      case "NFC" -> Normalizer2.getNFCInstance();
+      case "NFD" -> Normalizer2.getNFDInstance();
+      case "NFKC" -> Normalizer2.getNFKCInstance();
+      case "NFKD" -> Normalizer2.getNFKDInstance();
+      default -> throw QueryExecutionErrors.invalidNormalizeFormError(form.toString());
+    };
+    return UTF8String.fromString(normalizer.normalize(input.toString()));
   }
 
   public static byte[] aesEncrypt(byte[] input,
@@ -327,9 +354,9 @@ public class ExpressionImplUtils {
     if (str == null) return null;
     Locale locale;
     if (language != null && country != null) {
-      locale = new Locale(language.toString(), country.toString());
+      locale = Locale.of(language.toString(), country.toString());
     } else if (language != null) {
-      locale = new Locale(language.toString());
+      locale = Locale.of(language.toString());
     } else {
       locale = Locale.US;
     }
@@ -470,6 +497,14 @@ public class ExpressionImplUtils {
     CRC32 checksum = new CRC32();
     checksum.update(bytes, 0, bytes.length);
     return checksum.getValue();
+  }
+
+  /**
+   * Computes the FarmHash Fingerprint64 of {@code bytes} for the {@code farm_fingerprint}
+   * expression. Shared by the eval and codegen paths.
+   */
+  public static long farmFingerprint(byte[] bytes) {
+    return FARM_FINGERPRINT_64.hashBytes(bytes).asLong();
   }
 
   /**

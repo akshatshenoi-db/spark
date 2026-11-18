@@ -106,6 +106,8 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   private val printer = JsonFormat.printer().usingTypeRegistry(registry)
 
+  private val testUDT = new TestUDT.NewArrayUDT()
+
   private var session: SparkSession = _
 
   override protected def beforeAll(): Unit = {
@@ -606,6 +608,39 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   test("between expr") {
     simple.selectExpr("rand(123) BETWEEN 0.1 AND 0.2")
+  }
+
+  test("binBy") {
+    val input = session
+      .range(1)
+      .selectExpr(
+        "TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start",
+        "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end",
+        "100.0D AS value")
+    input.binBy(
+      rangeStart = input("start"),
+      rangeEnd = input("end"),
+      binWidth = fn.expr("INTERVAL 5 MINUTES"),
+      distributeUniform = Array(input("value")))
+  }
+
+  test("binBy all_options") {
+    val input = session
+      .range(1)
+      .selectExpr(
+        "TIMESTAMP_NTZ '2024-01-01 00:00:00' AS start",
+        "TIMESTAMP_NTZ '2024-01-01 00:10:00' AS end",
+        "100.0D AS value",
+        "20.0F AS value2")
+    input.binBy(
+      rangeStart = input("start"),
+      rangeEnd = input("end"),
+      binWidth = fn.expr("INTERVAL 5 MINUTES"),
+      distributeUniform = Array(input("value"), input("value2")),
+      alignTo = fn.expr("TIMESTAMP_NTZ '2024-01-01 00:02:00'"),
+      binStartName = "window_start",
+      binEndName = "window_end",
+      binDistributeRatioName = "ratio")
   }
 
   test("unpivot values") {
@@ -1623,6 +1658,10 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     fn.round(fn.col("b"), 2)
   }
 
+  functionTest("truncate") {
+    fn.truncate(fn.col("b"), 2)
+  }
+
   functionTest("sec") {
     fn.sec(fn.col("b"))
   }
@@ -1709,6 +1748,18 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   functionTest("crc32") {
     fn.crc32(fn.col("g").cast("binary"))
+  }
+
+  functionTest("xxh3_64") {
+    fn.xxh3_64(fn.col("g").cast("binary"))
+  }
+
+  functionTest("xxh3_128") {
+    fn.xxh3_128(fn.col("g").cast("binary"))
+  }
+
+  functionTest("farm_fingerprint") {
+    fn.farm_fingerprint(fn.col("g"))
   }
 
   functionTest("hash") {
@@ -2254,6 +2305,26 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     binary.select(fn.bitmap_or_agg(fn.col("bytes")))
   }
 
+  test("function bitmap_and") {
+    binary.select(fn.bitmap_and(fn.col("bytes"), fn.col("bytes")))
+  }
+
+  test("function bitmap_or") {
+    binary.select(fn.bitmap_or(fn.col("bytes"), fn.col("bytes")))
+  }
+
+  test("function bitmap_andnot") {
+    binary.select(fn.bitmap_andnot(fn.col("bytes"), fn.col("bytes")))
+  }
+
+  test("function bitmap_xor") {
+    binary.select(fn.bitmap_xor(fn.col("bytes"), fn.col("bytes")))
+  }
+
+  test("function bitmap_xor_agg") {
+    binary.select(fn.bitmap_xor_agg(fn.col("bytes")))
+  }
+
   private def temporalFunctionTest(name: String)(f: => Column): Unit = {
     test("function " + name) {
       temporals.select(f)
@@ -2577,6 +2648,10 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     fn.slice(fn.col("e"), 0, 5)
   }
 
+  functionTest("trim_array") {
+    fn.trim_array(fn.col("e"), 2)
+  }
+
   functionTest("array_join") {
     fn.array_join(fn.col("e"), ";")
   }
@@ -2803,6 +2878,14 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     fn.try_variant_array_append(fn.parse_json(fn.col("g")), "$.a", fn.lit(1))
   }
 
+  functionTest("variant_strip_nulls") {
+    fn.variant_strip_nulls(fn.parse_json(fn.col("g")), false)
+  }
+
+  functionTest("variant_pick") {
+    fn.variant_pick(fn.parse_json(fn.col("g")), "$.a", "$.b")
+  }
+
   functionTest("variant_get") {
     fn.variant_get(fn.parse_json(fn.col("g")), "$", "int")
   }
@@ -2813,6 +2896,14 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   functionTest("schema_of_variant") {
     fn.schema_of_variant(fn.parse_json(fn.col("g")))
+  }
+
+  functionTest("variant_from_arrays") {
+    fn.variant_from_arrays(fn.array(lit("a"), lit("b")), fn.array(lit(1), lit(2)))
+  }
+
+  functionTest("variant_from_entries") {
+    fn.variant_from_entries(fn.array(fn.struct(lit("a"), lit(1)), fn.struct(lit("b"), lit(2))))
   }
 
   functionTest("schema_of_variant_agg") {
@@ -3137,6 +3228,10 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     fn.json_object_keys(fn.col("g"))
   }
 
+  functionTest("json_typeof") {
+    fn.json_typeof(fn.col("g"))
+  }
+
   functionTest("mask with specific upperChar lowerChar digitChar otherChar") {
     fn.mask(fn.col("g"), fn.lit('X'), fn.lit('x'), fn.lit('n'), fn.lit('*'))
   }
@@ -3246,6 +3341,14 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   functionTest("typeof") {
     fn.typeof(fn.col("g"))
+  }
+
+  functionTest("wrap_udt") {
+    fn.wrap_udt(fn.array(fn.col("b")), testUDT)
+  }
+
+  functionTest("unwrap_udt") {
+    fn.unwrap_udt(fn.wrap_udt(fn.array(fn.col("b")), testUDT))
   }
 
   functionTest("stack") {

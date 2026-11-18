@@ -85,7 +85,10 @@ private[connect] object ErrorUtils extends Logging {
     while (buffer.size < MAX_ERROR_CHAIN_LENGTH && currentError != null) {
       val builder = FetchErrorDetailsResponse.Error
         .newBuilder()
-        .setMessage(currentError.getMessage)
+        .setMessage(
+          Option(currentError.getMessage)
+            .filter(_.nonEmpty)
+            .getOrElse(currentError.getClass.getName))
         .addAllErrorTypeHierarchy(
           ErrorUtils.allClasses(currentError.getClass).map(_.getName).asJava)
 
@@ -247,8 +250,8 @@ private[connect] object ErrorUtils extends Logging {
       case _ =>
     }
 
-    val enrichErrorEnabled = sessionHolderOpt.exists(
-      _.session.sessionState.conf.getConf(Connect.CONNECT_ENRICH_ERROR_ENABLED))
+    val enrichErrorEnabled =
+      sessionHolderOpt.exists(_.session.sqlConf.getConf(Connect.CONNECT_ENRICH_ERROR_ENABLED))
     if (enrichErrorEnabled) {
       // Generate a new unique key for this exception.
       val errorId = UUID.randomUUID().toString
@@ -260,8 +263,8 @@ private[connect] object ErrorUtils extends Logging {
     }
 
     lazy val stackTrace = Option(Utils.stackTraceToString(st))
-    val stackTraceEnabled = sessionHolderOpt.exists(
-      _.session.sessionState.conf.getConf(SQLConf.PYSPARK_JVM_STACKTRACE_ENABLED))
+    val stackTraceEnabled =
+      sessionHolderOpt.exists(_.session.sqlConf.getConf(SQLConf.PYSPARK_JVM_STACKTRACE_ENABLED))
     val withStackTrace =
       if (stackTraceEnabled && stackTrace.nonEmpty) {
         val maxSize = Math.min(
@@ -276,7 +279,7 @@ private[connect] object ErrorUtils extends Logging {
       .newBuilder()
       .setCode(RPCCode.INTERNAL_VALUE)
       .addDetails(ProtoAny.pack(withStackTrace.build()))
-      .setMessage(SparkConnectService.extractErrorMessage(st))
+      .setMessage(errorDescription(st))
       .build()
   }
 
@@ -285,6 +288,21 @@ private[connect] object ErrorUtils extends Logging {
     se.getCause != null && se.getCause
       .isInstanceOf[PythonException] && se.getCause.getStackTrace
       .exists(_.toString.contains("org.apache.spark.sql.execution.python"))
+  }
+
+  /**
+   * Returns a non-empty description for the given throwable: its abbreviated message when one is
+   * present, and its fully qualified class name otherwise. Both the INTERNAL status built for a
+   * non-fatal throwable and the UNKNOWN fallback status use this, so that a client never receives
+   * an error whose description is empty.
+   */
+  private def errorDescription(e: Throwable): String = {
+    val message = e.getMessage
+    if (message != null && message.nonEmpty) {
+      Utils.abbreviate(message, 2048)
+    } else {
+      e.getClass.getName
+    }
   }
 
   /**
@@ -331,6 +349,10 @@ private[connect] object ErrorUtils extends Logging {
           log"Error details will not be available for FetchErrorDetails.")
     }
 
+    def fallbackStatus(e: Throwable): StatusRuntimeException = {
+      Status.UNKNOWN.withCause(e).withDescription(errorDescription(e)).asRuntimeException()
+    }
+
     // Convert throwable to StatusRuntimeException with appropriate error metadata
     val wrapped: StatusRuntimeException = st match {
       case se: SparkException if isPythonExecutionException(se) =>
@@ -340,11 +362,16 @@ private[connect] object ErrorUtils extends Logging {
       case e: Throwable if e.isInstanceOf[SparkThrowable] || NonFatal.apply(e) =>
         StatusProto.toStatusRuntimeException(buildStatusFromThrowable(e, sessionHolderOpt))
 
-      case e: Throwable =>
-        Status.UNKNOWN
-          .withCause(e)
-          .withDescription(Utils.abbreviate(e.getMessage, 2048))
-          .asRuntimeException()
+      // Linkage errors are excluded by NonFatal but still need structured JVM error details.
+      case e: LinkageError =>
+        try {
+          StatusProto.toStatusRuntimeException(buildStatusFromThrowable(e, sessionHolderOpt))
+        } catch {
+          // Preserve the original error if constructing structured details also fails.
+          case NonFatal(_) | _: LinkageError => fallbackStatus(e)
+        }
+
+      case e: Throwable => fallbackStatus(e)
     }
 
     // Log the error based on context

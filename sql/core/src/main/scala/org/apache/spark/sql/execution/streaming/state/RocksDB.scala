@@ -159,10 +159,11 @@ class RocksDB(
   protected val fileChecksumThreadPoolSize: Option[Int] = {
     val size = conf.fileChecksumThreadPoolSize
     if (size < ChecksumCheckpointFileManager.DEFAULT_THREAD_POOL_SIZE) {
-      logWarning(s"fileChecksumThreadPoolSize for the state store file checksum thread pool " +
-        s"is set to $size, which is below the recommended default of " +
-        s"${ChecksumCheckpointFileManager.DEFAULT_THREAD_POOL_SIZE}. " +
-        "This may have performance impact.")
+      logWarning(log"fileChecksumThreadPoolSize for the state store file checksum thread pool " +
+        log"is set to ${MDC(LogKeys.THREAD_POOL_SIZE, size)}, which is below the recommended " +
+        log"default of ${MDC(LogKeys.DEFAULT_VALUE,
+          ChecksumCheckpointFileManager.DEFAULT_THREAD_POOL_SIZE)}. " +
+        log"This may have performance impact.")
     }
     Some(size)
   }
@@ -1656,6 +1657,36 @@ class RocksDB(
     } else {
       prefixScan(Array.empty[Byte], cfName)
     }
+  }
+
+  /**
+   * Return an iterator that remains open when exhausted so it can be refreshed and reused.
+   */
+  private[state] def reusableIterator(
+      cfName: String = StateStore.DEFAULT_COL_FAMILY_NAME): RocksDBIterator = {
+    updateMemoryUsageIfNeeded()
+    val virtualColumnFamilyId = if (useColumnFamilies) {
+      Some(getColumnFamilyInfo(cfName).cfId)
+    } else {
+      None
+    }
+    val reusableIterator = new RocksDBIterator(
+      db.newIterator(),
+      useColumnFamilies,
+      virtualColumnFamilyId,
+      conf.rowChecksumEnabled,
+      readVerifier,
+      delimiterSize)
+    if (useColumnFamilies) {
+      reusableIterator.seek(Array.emptyByteArray)
+    } else {
+      reusableIterator.seekToFirst()
+    }
+
+    Option(TaskContext.get()).foreach { tc =>
+      tc.addTaskCompletionListener[Unit] { _ => reusableIterator.close() }
+    }
+    reusableIterator
   }
 
   private def countKeys(): (Long, Long) = {

@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.analysis
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, EqualNullSafe, Expression, If, Literal, MetadataAttribute, Not, SubqueryExpression}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.plans.logical.{Assignment, Expand, Filter, LogicalPlan, Project, ReplaceData, Union, UpdateTable, WriteDelta}
+import org.apache.spark.sql.catalyst.trees.TreePattern.UPDATE_TABLE
 import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations
 import org.apache.spark.sql.connector.write.{RowLevelOperationTable, SupportsDelta}
@@ -34,22 +35,24 @@ import org.apache.spark.sql.types.IntegerType
  */
 object RewriteUpdateTable extends RewriteRowLevelCommand {
 
-  override def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsWithPruning(
+    _.containsPattern(UPDATE_TABLE)) {
     case u @ UpdateTable(aliasedTable, assignments, cond)
         if u.resolved && u.rewritable && u.aligned =>
 
       EliminateSubqueryAliases(aliasedTable) match {
         case r @ ExtractV2Table(tbl: SupportsRowLevelOperations) =>
           checkNoGeneratedColumns(r, UPDATE)
+          val dataAssignments = removeMetadataAssignments(assignments, isSelfAssignment)
           val table = buildOperationTable(tbl, UPDATE, r.options)
           val updateCond = cond.getOrElse(TrueLiteral)
           table.operation match {
             case _: SupportsDelta =>
-              buildWriteDeltaPlan(r, table, assignments, updateCond)
+              buildWriteDeltaPlan(r, table, dataAssignments, updateCond)
             case _ if SubqueryExpression.hasSubquery(updateCond) =>
-              buildReplaceDataWithUnionPlan(r, table, assignments, updateCond)
+              buildReplaceDataWithUnionPlan(r, table, dataAssignments, updateCond)
             case _ =>
-              buildReplaceDataPlan(r, table, assignments, updateCond)
+              buildReplaceDataPlan(r, table, dataAssignments, updateCond)
           }
 
         case _ =>
@@ -69,14 +72,17 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     val metadataAttrs = resolveRequiredMetadataAttrs(relation, operationTable.operation)
 
     // construct a read relation and include all required metadata columns
-    val readRelation = buildRelationWithAttrs(relation, operationTable, metadataAttrs)
+    // as well as metadata columns referenced in the condition or assignments
+    val referencedMetadataAttrs = resolveReferencedMetadataAttrs(relation, cond +: assignments)
+    val readRelation = buildRelationWithAttrs(
+      relation, operationTable, metadataAttrs ++ referencedMetadataAttrs)
 
     // build a plan with updated and copied over records
     val query = buildReplaceDataUpdateProjection(readRelation, assignments, cond)
 
     // build a plan to replace read groups in the table
     val writeRelation = relation.copy(table = operationTable)
-    val projections = buildReplaceDataProjections(query, relation.output, metadataAttrs)
+    val projections = buildReplaceDataProjections(query, dataAttrs(relation), metadataAttrs)
     val groupFilterCond = if (groupFilterEnabled) Some(cond) else None
     ReplaceData(writeRelation, cond, query, relation, projections, groupFilterCond)
   }
@@ -93,9 +99,12 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     val metadataAttrs = resolveRequiredMetadataAttrs(relation, operationTable.operation)
 
     // construct a read relation and include all required metadata columns
+    // as well as metadata columns referenced in the condition or assignments
     // the same read relation will be used to read records that must be updated and copied over
     // the analyzer will take care of duplicated attr IDs
-    val readRelation = buildRelationWithAttrs(relation, operationTable, metadataAttrs)
+    val referencedMetadataAttrs = resolveReferencedMetadataAttrs(relation, cond +: assignments)
+    val readRelation = buildRelationWithAttrs(
+      relation, operationTable, metadataAttrs ++ referencedMetadataAttrs)
 
     // build a plan for updated records that match the condition
     val matchedRowsPlan = Filter(cond, readRelation)
@@ -111,7 +120,7 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
 
     // build a plan to replace read groups in the table
     val writeRelation = relation.copy(table = operationTable)
-    val projections = buildReplaceDataProjections(query, relation.output, metadataAttrs)
+    val projections = buildReplaceDataProjections(query, dataAttrs(relation), metadataAttrs)
     val groupFilterCond = if (groupFilterEnabled) Some(cond) else None
     ReplaceData(writeRelation, cond, query, relation, projections, groupFilterCond)
   }
@@ -124,9 +133,9 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
 
     // the plan output may include metadata columns at the end
     // that's why the number of assignments may not match the number of plan output columns
-    val assignedValues = assignments.map(_.value)
+    val assignedValues = assignments.map(_.value).toIndexedSeq
     val updatedValues = plan.output.zipWithIndex.map { case (attr, index) =>
-      if (index < assignments.size) {
+      if (index < assignedValues.size) {
         val assignedExpr = assignedValues(index)
         val updatedValue = If(cond, assignedExpr, attr)
         Alias(updatedValue, attr.name)()
@@ -156,12 +165,15 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     val operation = operationTable.operation.asInstanceOf[SupportsDelta]
 
     // resolve all needed attrs (e.g. row ID and any required metadata attrs)
-    val rowAttrs = relation.output
+    val rowAttrs = dataAttrs(relation)
     val rowIdAttrs = resolveRowIdAttrs(relation, operation)
     val metadataAttrs = resolveRequiredMetadataAttrs(relation, operation)
 
     // construct a read relation and include all required metadata columns
-    val readRelation = buildRelationWithAttrs(relation, operationTable, metadataAttrs, rowIdAttrs)
+    // as well as metadata columns referenced in the condition or assignments
+    val referencedMetadataAttrs = resolveReferencedMetadataAttrs(relation, cond +: assignments)
+    val readRelation = buildRelationWithAttrs(
+      relation, operationTable, metadataAttrs ++ referencedMetadataAttrs, rowIdAttrs)
 
     // build a plan for updated records that match the condition
     val matchedRowsPlan = Filter(cond, readRelation)
@@ -186,9 +198,9 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
 
     // the plan output may include immutable metadata columns at the end
     // that's why the number of assignments may not match the number of plan output columns
-    val assignedValues = assignments.map(_.value)
+    val assignedValues = assignments.map(_.value).toIndexedSeq
     val updatedValues = plan.output.zipWithIndex.map { case (attr, index) =>
-      if (index < assignments.size) {
+      if (index < assignedValues.size) {
         val assignedExpr = assignedValues(index)
         Alias(assignedExpr, attr.name)()
       } else {

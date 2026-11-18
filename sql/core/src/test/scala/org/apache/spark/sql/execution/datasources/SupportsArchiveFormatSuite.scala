@@ -30,10 +30,13 @@ import org.apache.commons.compress.archivers.sevenz.{SevenZArchiveEntry, SevenZO
 import org.apache.commons.compress.archivers.tar.{TarArchiveEntry, TarArchiveOutputStream}
 import org.apache.commons.compress.archivers.zip.{ZipArchiveEntry, ZipArchiveOutputStream}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.{GlobPattern, Path}
+import org.apache.hadoop.io.compress.GzipCodec
 
-import org.apache.spark.{SparkRuntimeException, TaskContext, TaskContextImpl}
+import org.apache.spark.{SparkRuntimeException, SparkUnsupportedOperationException, TaskContext, TaskContextImpl}
+import org.apache.spark.io.HadoopCodecStreams
 import org.apache.spark.sql.QueryTest
+import org.apache.spark.sql.catalyst.FileSourceOptions
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -222,9 +225,18 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
 
   /** Drains every entry into `(name, decodedText)` pairs through `SupportsArchiveFormat`. */
   private def collect(file: File): Seq[(String, String)] =
-    SupportsArchiveFormat.readArchiveEntries(new Path(file.toURI), new Configuration()) {
+    SupportsArchiveFormat.readArchiveEntries(
+        new Path(file.toURI), new Configuration(), archivePathFilter = None) {
       (entry, in) =>
         Iterator.single((entry.getName, new String(readAll(in), StandardCharsets.UTF_8)))
+    }.toList
+
+  /** Drains every entry through `SupportsArchiveFormat` under an `archivePathFilter` glob. */
+  private def collectFiltered(file: File, glob: String): Seq[String] =
+    SupportsArchiveFormat.readArchiveEntries(
+        new Path(file.toURI), new Configuration(),
+        archivePathFilter = Some(new GlobPattern(glob))) { (entry, _) =>
+      Iterator.single(entry.getName)
     }.toList
 
   // ----- isArchivePath ------------------------------------------------------
@@ -332,7 +344,8 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
       // HadoopFSUtils.shouldFilterOutPathName still apply -- mirroring a loose-file listing with
       // the ignoredPathSegmentRegex option set to the same regex.
       val entries = SupportsArchiveFormat.readArchiveEntries(
-        new Path(tar.toURI), new Configuration(), Pattern.compile("(?!)")) { (entry, in) =>
+        new Path(tar.toURI), new Configuration(), Pattern.compile("(?!)"),
+        archivePathFilter = None) { (entry, in) =>
         Iterator.single((entry.getName, new String(readAll(in), StandardCharsets.UTF_8)))
       }.toList
       assert(entries == Seq("_SUCCESS" -> "marker", "real.csv" -> "kept"))
@@ -347,7 +360,8 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
       val opened = ArrayBuffer[String]()
       // parseEntry yields a single element without reading the stream, so each invocation maps to
       // exactly one consumed output element -- letting us observe when the next entry is opened.
-      val it = SupportsArchiveFormat.readArchiveEntries(new Path(tar.toURI), new Configuration()) {
+      val it = SupportsArchiveFormat.readArchiveEntries(
+        new Path(tar.toURI), new Configuration(), archivePathFilter = None) {
         (entry, _) =>
           opened += entry.getName
           Iterator.single(entry.getName)
@@ -375,7 +389,8 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
       writeTar(tar, Seq(textEntry("a.csv", "a"), textEntry("b.csv", "b")))
 
       val seen = ArrayBuffer[String]()
-      val it = SupportsArchiveFormat.readArchiveEntries(new Path(tar.toURI), new Configuration()) {
+      val it = SupportsArchiveFormat.readArchiveEntries(
+        new Path(tar.toURI), new Configuration(), archivePathFilter = None) {
         (entry, in) =>
           val body = new String(readAll(in), StandardCharsets.UTF_8)
           in.close() // must NOT close the underlying archive
@@ -392,7 +407,8 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
       val tar = new File(dir, "closeable.tar")
       writeTar(tar, Seq(textEntry("a.csv", "a"), textEntry("b.csv", "b")))
 
-      val it = SupportsArchiveFormat.readArchiveEntries(new Path(tar.toURI), new Configuration()) {
+      val it = SupportsArchiveFormat.readArchiveEntries(
+        new Path(tar.toURI), new Configuration(), archivePathFilter = None) {
         (entry, _) => Iterator.single(entry.getName)
       }
       assert(it.hasNext)
@@ -421,7 +437,7 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
       TaskContext.setTaskContext(ctx)
       try {
         val it = SupportsArchiveFormat.readArchiveEntries(
-          new Path(tar.toURI), new Configuration()) {
+          new Path(tar.toURI), new Configuration(), archivePathFilter = None) {
           (entry, _) => Iterator.single(entry.getName)
         }
         assert(it.hasNext)
@@ -490,7 +506,8 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
       writeZip(zip, Seq(textEntry("a.csv", "a"), textEntry("b.csv", "b"), textEntry("c.csv", "c")))
 
       val opened = ArrayBuffer[String]()
-      val it = SupportsArchiveFormat.readArchiveEntries(new Path(zip.toURI), new Configuration()) {
+      val it = SupportsArchiveFormat.readArchiveEntries(
+        new Path(zip.toURI), new Configuration(), archivePathFilter = None) {
         (entry, _) =>
           opened += entry.getName
           Iterator.single(entry.getName)
@@ -515,7 +532,8 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
       writeZip(zip, Seq(textEntry("a.csv", "a"), textEntry("b.csv", "b")))
 
       val seen = ArrayBuffer[String]()
-      val it = SupportsArchiveFormat.readArchiveEntries(new Path(zip.toURI), new Configuration()) {
+      val it = SupportsArchiveFormat.readArchiveEntries(
+        new Path(zip.toURI), new Configuration(), archivePathFilter = None) {
         (entry, in) =>
           val body = new String(readAll(in), StandardCharsets.UTF_8)
           in.close() // must NOT close the underlying archive
@@ -631,6 +649,91 @@ class SupportsArchiveFormatSuite extends QueryTest with SharedSparkSession {
         textEntry("real.csv", "kept"),
         textEntry("nested/._sidecar", "junk2")))   // dotfile in a subdir
       assert(collect(sevenZ) == Seq("real.csv" -> "kept"))
+    }
+  }
+
+  // ----- archivePathFilter ---------------------------------------------------
+
+  test("readArchiveEntries: archivePathFilter keeps only entries matching the glob") {
+    withTempDir { dir =>
+      val tar = new File(dir, "filter.tar")
+      writeTar(tar, Seq(
+        textEntry("sub/a.csv", "a"),
+        textEntry("sub/b.csv", "b"),
+        textEntry("other/c.csv", "c")))
+      // The glob matches the entry's full path, so `sub/*` selects only the `sub/` entries.
+      assert(collectFiltered(tar, "sub/*") == Seq("sub/a.csv", "sub/b.csv"))
+    }
+  }
+
+  test("readArchiveEntries: archivePathFilter with a `*` glob crosses directory boundaries") {
+    withTempDir { dir =>
+      val tar = new File(dir, "filter-ext.tar")
+      writeTar(tar, Seq(
+        textEntry("top.csv", "t"),
+        textEntry("sub/nested.csv", "n"),
+        textEntry("keep.json", "j")))
+      assert(collectFiltered(tar, "*.csv") == Seq("top.csv", "sub/nested.csv"))
+    }
+  }
+
+  test("readArchiveEntries: archivePathFilter matching nothing yields an empty iterator") {
+    withTempDir { dir =>
+      val tar = new File(dir, "filter-none.tar")
+      writeTar(tar, Seq(textEntry("a.csv", "a"), textEntry("b.csv", "b")))
+      assert(collectFiltered(tar, "nomatch/*").isEmpty)
+    }
+  }
+
+  test("readArchiveEntries: archivePathFilter applies on top of hidden-entry filtering") {
+    withTempDir { dir =>
+      val tar = new File(dir, "filter-hidden.tar")
+      writeTar(tar, Seq(
+        textEntry("data/real.csv", "kept"),
+        textEntry("data/_SUCCESS", "marker"))) // matches the glob but hidden by the default regex
+      assert(collectFiltered(tar, "data/*") == Seq("data/real.csv"))
+    }
+  }
+
+  test("archivePathFilter: an invalid glob is rejected with a clear error") {
+    val ex = intercept[IllegalArgumentException](
+      FileSourceOptions.compileArchivePathFilter("["))
+    assert(ex.getMessage.contains("archivePathFilter"))
+  }
+
+  test("archivePathFilter: an empty value disables the filter rather than matching nothing") {
+    val options = new FileSourceOptions(
+      Map(FileSourceOptions.ARCHIVE_PATH_FILTER -> ""))
+    assert(options.archivePathFilter.isEmpty)
+    assert(options.archivePathFilterPattern.isEmpty)
+  }
+
+  // ----- decompression -------------------------------------------------------
+
+  test("readArchiveEntries: a forced decompression codec is rejected when the archive is opened") {
+    // The driver-side checks normally reject the `decompression` option first; this backstop in
+    // the archive reader covers any path that reaches it with the internal codec key still set,
+    // both for a codec class and for `none` (encoded as an empty value).
+    withTempDir { dir =>
+      val entries = Seq(textEntry("a.csv", "1\n"))
+      val archives = Seq(
+        new File(dir, "data.tar") -> writeTar _,
+        new File(dir, "data.tar.gz") -> writeTarGz _,
+        new File(dir, "data.zip") -> writeZip _,
+        new File(dir, "data.7z") -> writeSevenZ _)
+      archives.foreach { case (file, write) => write(file, entries) }
+      for ((file, _) <- archives; codec <- Seq(classOf[GzipCodec].getName, "")) {
+        val conf = new Configuration()
+        conf.set(HadoopCodecStreams.DECOMPRESSION_CODEC_CONF, codec)
+        val e = intercept[SparkUnsupportedOperationException] {
+          SupportsArchiveFormat.readArchiveEntries(
+              new Path(file.toURI), conf, archivePathFilter = None) { (entry, _) =>
+            Iterator.single(entry.getName)
+          }.toList
+        }
+        assert(e.getCondition == "UNSUPPORTED_FEATURE.DECOMPRESSION_CODEC_FOR_ARCHIVE",
+          s"${file.getName} with codec '$codec'")
+      }
     }
   }
 

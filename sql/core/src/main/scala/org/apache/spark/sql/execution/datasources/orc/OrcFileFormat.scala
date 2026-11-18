@@ -28,12 +28,11 @@ import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
 import org.apache.orc.{OrcUtils => _, _}
 import org.apache.orc.OrcConf.COMPRESS
 import org.apache.orc.mapred.OrcStruct
-import org.apache.orc.mapreduce._
 
 import org.apache.spark.TaskContext
 import org.apache.spark.memory.MemoryMode
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.{FileSourceOptions, InternalRow}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
@@ -178,6 +177,7 @@ class OrcFileFormat
     val isCaseSensitive = sqlConf.caseSensitiveAnalysis
     val orcFilterPushDown = sqlConf.orcFilterPushDown
     val archiveFormatEnabled = sqlConf.getConf(SQLConf.ARCHIVE_FORMAT_READER_ENABLED)
+    val fileSourceOptions = new FileSourceOptions(options)
 
     def readSingleFile(file: PartitionedFile): Iterator[InternalRow] = {
       val conf = broadcastedConf.value.value
@@ -195,11 +195,11 @@ class OrcFileFormat
         Iterator.empty
       } else {
         // ORC predicate pushdown
-        if (orcFilterPushDown && filters.nonEmpty) {
+        val searchArgument = if (orcFilterPushDown && filters.nonEmpty) {
           val fileSchema = OrcUtils.toCatalystSchema(orcSchema)
-          OrcFilters.createFilter(fileSchema, filters).foreach { f =>
-            OrcInputFormat.setSearchArgument(conf, f, fileSchema.fieldNames)
-          }
+          OrcFilters.createFilter(fileSchema, filters, Some(requiredSchema))
+        } else {
+          None
         }
 
         val (requestedColIds, canPruneCols) = resultedColPruneInfo.get
@@ -225,7 +225,8 @@ class OrcFileFormat
           val requestedDataColIds = requestedColIds ++ Array.fill(partitionSchema.length)(-1)
           val requestedPartitionColIds =
             Array.fill(requiredSchema.length)(-1) ++ Range(0, partitionSchema.length)
-          batchReader.initialize(fileSplit, taskAttemptContext, readerOptions.getOrcTail)
+          batchReader.initialize(
+            fileSplit, taskAttemptContext, readerOptions.getOrcTail, searchArgument.orNull)
           batchReader.initBatch(
             TypeDescription.fromString(resultSchemaString),
             resultSchema.fields,
@@ -236,7 +237,7 @@ class OrcFileFormat
           iter.asInstanceOf[Iterator[InternalRow]]
         } else {
           val orcRecordReader = OrcUtils.createOrcMapreduceRecordReader(
-            filePath, taskConf, fileSplit, readerOptions)
+            filePath, taskConf, fileSplit, readerOptions, searchArgument)
           val iter = new RecordReaderIterator[OrcStruct](orcRecordReader)
           Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => iter.close()))
 
@@ -257,7 +258,9 @@ class OrcFileFormat
 
     (file: PartitionedFile) => {
       if (archiveFormatEnabled && SupportsArchiveFormat.isArchivePath(file.toPath)) {
-        readLocalizedEntries(file, broadcastedConf.value.value, "orc-archive") { entryFile =>
+        readLocalizedEntries(
+            file, broadcastedConf.value.value, "orc-archive",
+            fileSourceOptions.archivePathFilterPattern) { entryFile =>
           readSingleFile(entryFile)
         }
       } else {
