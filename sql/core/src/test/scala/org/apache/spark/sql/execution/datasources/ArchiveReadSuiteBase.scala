@@ -254,6 +254,16 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
     writeArchive(dest, Seq(s"nested.$ext" -> archiveBytes(entries, ext)))
   }
 
+  /** Runs `body` and returns the depth limit error it must fail with, thrown or as a cause. */
+  private def interceptDepthLimit(body: => Any): SparkRuntimeException = {
+    val e = intercept[Exception](body)
+    Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null)
+      .collectFirst {
+        case t: SparkRuntimeException if t.getCondition == "MAX_ARCHIVE_DEPTH_EXCEEDED" => t
+      }
+      .getOrElse(fail(s"expected the depth limit error, got $e"))
+  }
+
   /**
    * Writes `entries` both into an archive and as loose files in a directory, then asserts the
    * archive read produces exactly the same rows as the directory read.
@@ -537,13 +547,13 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
       }
       // 2 stops before the innermost archive is opened.
       checkError(
-        exception = intercept[SparkRuntimeException](readAtMaxDepth(2)),
+        exception = interceptDepthLimit(readAtMaxDepth(2)),
         condition = "MAX_ARCHIVE_DEPTH_EXCEEDED",
         parameters = Map(
           "entry" -> s"level2.$ext!/level3.$ext", "path" -> path, "maxDepth" -> "2"))
       // 1 admits only the top archive, so even the first nested archive is too deep.
       checkError(
-        exception = intercept[SparkRuntimeException](readAtMaxDepth(1)),
+        exception = interceptDepthLimit(readAtMaxDepth(1)),
         condition = "MAX_ARCHIVE_DEPTH_EXCEEDED",
         parameters = Map("entry" -> s"level2.$ext", "path" -> path, "maxDepth" -> "1"))
     }
@@ -589,8 +599,7 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
           SQLConf.IGNORE_CORRUPT_FILES.key -> "true",
           SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH.key -> "1") {
         checkError(
-          exception =
-            intercept[SparkRuntimeException](read(archive.getCanonicalPath).collect()),
+          exception = interceptDepthLimit(read(archive.getCanonicalPath).collect()),
           condition = "MAX_ARCHIVE_DEPTH_EXCEEDED",
           parameters = Map(
             "entry" -> s"level2.$ext",
@@ -609,14 +618,8 @@ trait ArchiveReadSuiteBase extends QueryTest with SharedSparkSession {
         withSQLConf(
             SQLConf.IGNORE_CORRUPT_FILES.key -> "true",
             SQLConf.ARCHIVE_READER_MAX_NESTING_DEPTH.key -> "1") {
-          val e = intercept[Exception](inferredSchema(Seq(archive.getCanonicalPath)))
-          // Some formats report the depth error itself; others wrap it in a file-read failure.
-          val depthError = Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null)
-            .collectFirst {
-              case t: SparkRuntimeException if t.getCondition == "MAX_ARCHIVE_DEPTH_EXCEEDED" => t
-            }
           checkError(
-            exception = depthError.getOrElse(fail(s"expected the depth limit error, got $e")),
+            exception = interceptDepthLimit(inferredSchema(Seq(archive.getCanonicalPath))),
             condition = "MAX_ARCHIVE_DEPTH_EXCEEDED",
             parameters = Map(
               "entry" -> s"level2.$ext",
